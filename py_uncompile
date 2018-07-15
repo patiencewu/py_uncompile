@@ -1,0 +1,4238 @@
+#!/usr/bin/env python
+__author__ = "Patience Wu"
+"""
+Usage: uncompyler [OPTIONS]... [ FILE | DIR]...
+
+Examples:
+  uncompyler      foo.pyc bar.pyc       # decompile foo.pyc, bar.pyc to stdout
+  uncompyler -o . foo.pyc bar.pyc       # decompile to ./foo.dis and ./bar.dis
+  uncompyler -o /tmp /usr/lib/python1.5 # decompile whole library
+
+Options:
+  -o <path>     output decompiled files to this path:
+                if multiple input files are decompiled, the common prefix
+                is stripped from these names and the remainder appended to
+                <path>
+                  uncompyle -o /tmp bla/fasel.pyc bla/foo.pyc
+                    -> /tmp/fasel.dis, /tmp/foo.dis
+                  uncompyle -o /tmp bla/fasel.pyc bar/foo.pyc
+                    -> /tmp/bla/fasel.dis, /tmp/bar/foo.dis
+  -s            if multiple input files are decompiled, the common prefix
+                is stripped from these names and the remainder appended to
+                <path>
+                  uncompyle -o /tmp /usr/lib/python1.5
+                    -> /tmp/smtplib.dis ... /tmp/lib-tk/FixTk.dis
+  -c <file>     attempts a disassembly after compiling <file>
+  -d            do not print timestamps
+  -m            use multiprocessing
+  --py          use '.py' extension for generated files
+  --norecur     don't recurse directories looking for .pyc and .pyo files
+  --verify      compare generated source with input byte-code
+                (requires -o)
+  --help        show this message
+
+Debugging Options:
+  --showasm   -a  include byte-code                  (disables --verify)
+  --showast   -t  include AST (abstract syntax tree) (disables --verify)
+
+Extensions of generated files:
+  '.pyc_dis' '.pyo_dis'   successfully decompiled (and verified if --verify)
+  '.py'                   with --py option
+    + '_unverified'       successfully decompile but --verify failed
+    + '_failed'           uncompyle failed (contact author for enhancement)
+"""
+import sys, re, cStringIO
+from types import ListType, TupleType, DictType, EllipsisType, IntType, CodeType
+import types
+import operator
+import dis
+import types
+import dis
+from collections import namedtuple
+from array import array
+from operator import itemgetter
+import string, exceptions, sys
+from UserList import UserList
+import struct
+import sys, types, os
+import sys, os, getopt
+if sys.version[:3] != '2.7':
+    print >> sys.stderr, 'Error:  uncompyler requires Python 2.7.'
+    sys.exit(-1)
+import time
+from multiprocessing import Process, Queue, cpu_count
+from Queue import Empty
+
+class Token():
+    """
+    Class representing a byte-code token.
+    
+    A byte-code token is equivalent to the contents of one line
+    as output by dis.dis().
+    """
+
+    def __init__(self, type_, attr = None, pattr = None, offset = -1, linestart = False):
+        self.type = intern(type_)
+        self.attr = attr
+        self.pattr = pattr
+        self.offset = offset
+        self.linestart = linestart
+
+    def __cmp__(self, o):
+        if isinstance(o, Token):
+            return cmp(self.type, o.type) or cmp(self.pattr, o.pattr)
+        else:
+            return cmp(self.type, o)
+
+    def __repr__(self):
+        return str(self.type)
+
+    def __str__(self):
+        pattr = self.pattr
+        if self.linestart:
+            return '\n%s\t%-17s %r' % (self.offset, self.type, pattr)
+        else:
+            return '%s\t%-17s %r' % (self.offset, self.type, pattr)
+
+    def __hash__(self):
+        return hash(self.type)
+
+    def __getitem__(self, i):
+        raise IndexError
+
+
+class AST(UserList):
+
+    def __init__(self, type, kids = []):
+        self.type = intern(type)
+        UserList.__init__(self, kids)
+
+    def __getslice__(self, low, high):
+        return self.data[low:high]
+
+    def __eq__(self, o):
+        if isinstance(o, AST):
+            return self.type == o.type and UserList.__eq__(self, o)
+        else:
+            return self.type == o
+
+    def __hash__(self):
+        return hash(self.type)
+
+    def __repr__(self, indent = ''):
+        rv = str(self.type)
+        for k in self:
+            rv = rv + '\n' + string.replace(str(k), '\n', '\n   ')
+
+        return rv
+
+
+minint = -sys.maxint - 1
+RETURN_LOCALS = AST('return_stmt', [AST('ret_expr', [AST('expr', [Token('LOAD_LOCALS')])]), Token('RETURN_VALUE')])
+NONE = AST('expr', [Token('LOAD_CONST', pattr=None)])
+RETURN_NONE = AST('stmt', [AST('return_stmt', [NONE, Token('RETURN_VALUE')])])
+PASS = AST('stmts', [AST('sstmt', [AST('stmt', [AST('passstmt', [])])])])
+ASSIGN_DOC_STRING = lambda doc_string: AST('stmt', [AST('assign', [AST('expr', [Token('LOAD_CONST', pattr=doc_string)]), AST('designator', [Token('STORE_NAME', pattr='__doc__')])])])
+BUILD_TUPLE_0 = AST('expr', [AST('build_list', [Token('BUILD_TUPLE_0')])])
+NAME_MODULE = AST('stmt', [AST('assign', [AST('expr', [Token('LOAD_NAME', pattr='__name__')]), AST('designator', [Token('STORE_NAME', pattr='__module__')])])])
+TAB = ' ' * 4
+INDENT_PER_LEVEL = ' '
+TABLE_R = {'POP_TOP': ('%|%c\n', 0),
+ 'STORE_ATTR': ('%c.%[1]{pattr}', 0),
+ 'STORE_SLICE+0': ('%c[:]', 0),
+ 'STORE_SLICE+1': ('%c[%p:]', 0, (1, 100)),
+ 'STORE_SLICE+2': ('%c[:%p]', 0, (1, 100)),
+ 'STORE_SLICE+3': ('%c[%p:%p]',
+                   0,
+                   (1, 100),
+                   (2, 100)),
+ 'DELETE_SLICE+0': ('%|del %c[:]\n', 0),
+ 'DELETE_SLICE+1': ('%|del %c[%c:]\n', 0, 1),
+ 'DELETE_SLICE+2': ('%|del %c[:%c]\n', 0, 1),
+ 'DELETE_SLICE+3': ('%|del %c[%c:%c]\n',
+                    0,
+                    1,
+                    2),
+ 'DELETE_ATTR': ('%|del %c.%[-1]{pattr}\n', 0)}
+TABLE_R0 = {}
+TABLE_DIRECT = {'BINARY_ADD': ('+',),
+ 'BINARY_SUBTRACT': ('-',),
+ 'BINARY_MULTIPLY': ('*',),
+ 'BINARY_DIVIDE': ('/',),
+ 'BINARY_TRUE_DIVIDE': ('/',),
+ 'BINARY_FLOOR_DIVIDE': ('//',),
+ 'BINARY_MODULO': ('%%',),
+ 'BINARY_POWER': ('**',),
+ 'BINARY_LSHIFT': ('<<',),
+ 'BINARY_RSHIFT': ('>>',),
+ 'BINARY_AND': ('&',),
+ 'BINARY_OR': ('|',),
+ 'BINARY_XOR': ('^',),
+ 'INPLACE_ADD': ('+=',),
+ 'INPLACE_SUBTRACT': ('-=',),
+ 'INPLACE_MULTIPLY': ('*=',),
+ 'INPLACE_DIVIDE': ('/=',),
+ 'INPLACE_TRUE_DIVIDE': ('/=',),
+ 'INPLACE_FLOOR_DIVIDE': ('//=',),
+ 'INPLACE_MODULO': ('%%=',),
+ 'INPLACE_POWER': ('**=',),
+ 'INPLACE_LSHIFT': ('<<=',),
+ 'INPLACE_RSHIFT': ('>>=',),
+ 'INPLACE_AND': ('&=',),
+ 'INPLACE_OR': ('|=',),
+ 'INPLACE_XOR': ('^=',),
+ 'binary_expr': ('%c %c %c',
+                 0,
+                 -1,
+                 1),
+ 'UNARY_POSITIVE': ('+',),
+ 'UNARY_NEGATIVE': ('-',),
+ 'UNARY_INVERT': '~%c',
+ 'unary_expr': ('%c%c', 1, 0),
+ 'unary_not': ('not %c', 0),
+ 'unary_convert': ('`%c`', 0),
+ 'get_iter': ('iter(%c)', 0),
+ 'slice0': ('%c[:]', 0),
+ 'slice1': ('%c[%p:]', 0, (1, 100)),
+ 'slice2': ('%c[:%p]', 0, (1, 100)),
+ 'slice3': ('%c[%p:%p]',
+            0,
+            (1, 100),
+            (2, 100)),
+ 'IMPORT_FROM': ('%{pattr}',),
+ 'load_attr': ('%c.%[1]{pattr}', 0),
+ 'LOAD_FAST': ('%{pattr}',),
+ 'LOAD_NAME': ('%{pattr}',),
+ 'LOAD_GLOBAL': ('%{pattr}',),
+ 'LOAD_DEREF': ('%{pattr}',),
+ 'LOAD_LOCALS': ('locals()',),
+ 'LOAD_ASSERT': ('%{pattr}',),
+ 'DELETE_FAST': ('%|del %{pattr}\n',),
+ 'DELETE_NAME': ('%|del %{pattr}\n',),
+ 'DELETE_GLOBAL': ('%|del %{pattr}\n',),
+ 'delete_subscr': ('%|del %c[%c]\n', 0, 1),
+ 'binary_subscr': ('%c[%p]', 0, (1, 100)),
+ 'binary_subscr2': ('%c[%p]', 0, (1, 100)),
+ 'store_subscr': ('%c[%c]', 0, 1),
+ 'STORE_FAST': ('%{pattr}',),
+ 'STORE_NAME': ('%{pattr}',),
+ 'STORE_GLOBAL': ('%{pattr}',),
+ 'STORE_DEREF': ('%{pattr}',),
+ 'unpack': ('%C%,', (1, sys.maxint, ', ')),
+ 'unpack_w_parens': ('(%C%,)', (1, sys.maxint, ', ')),
+ 'unpack_list': ('[%C]', (1, sys.maxint, ', ')),
+ 'build_tuple2': ('%P', (0,
+                   -1,
+                   ', ',
+                   100)),
+ 'list_iter': ('%c', 0),
+ 'list_for': (' for %c in %c%c',
+              2,
+              0,
+              3),
+ 'list_if': (' if %c%c', 0, 2),
+ 'list_if_not': (' if not %p%c', (0, 22), 2),
+ 'lc_body': ('',),
+ 'comp_iter': ('%c', 0),
+ 'comp_for': (' for %c in %c%c',
+              2,
+              0,
+              3),
+ 'comp_if': (' if %c%c', 0, 2),
+ 'comp_ifnot': (' if not %p%c', (0, 22), 2),
+ 'comp_body': ('',),
+ 'set_comp_body': ('%c', 0),
+ 'gen_comp_body': ('%c', 0),
+ 'dict_comp_body': ('%c:%c', 1, 0),
+ 'assign': ('%|%c = %p\n', -1, (0, 200)),
+ 'augassign1': ('%|%c %c %c\n',
+                0,
+                2,
+                1),
+ 'augassign2': ('%|%c.%[2]{pattr} %c %c\n',
+                0,
+                -3,
+                -4),
+ 'designList': ('%c = %c', 0, -1),
+ 'and': ('%c and %c', 0, 2),
+ 'ret_and': ('%c and %c', 0, 2),
+ 'and2': ('%c', 3),
+ 'or': ('%c or %c', 0, 2),
+ 'ret_or': ('%c or %c', 0, 2),
+ 'conditional': ('%p if %p else %p',
+                 (2, 27),
+                 (0, 27),
+                 (4, 27)),
+ 'ret_cond': ('%p if %p else %p',
+              (2, 27),
+              (0, 27),
+              (4, 27)),
+ 'conditionalnot': ('%p if not %p else %p',
+                    (2, 27),
+                    (0, 22),
+                    (4, 27)),
+ 'ret_cond_not': ('%p if not %p else %p',
+                  (2, 27),
+                  (0, 22),
+                  (4, 27)),
+ 'conditional_lambda': ('(%c if %c else %c)',
+                        2,
+                        0,
+                        3),
+ 'return_lambda': ('%c', 0),
+ 'compare': ('%p %[-1]{pattr} %p', (0, 19), (1, 19)),
+ 'cmp_list': ('%p %p', (0, 20), (1, 19)),
+ 'cmp_list1': ('%[3]{pattr} %p %p', (0, 19), (-2, 19)),
+ 'cmp_list2': ('%[1]{pattr} %p', (0, 19)),
+ 'funcdef': ('\n\n%|def %c\n', -2),
+ 'funcdefdeco': ('\n\n%c', 0),
+ 'mkfuncdeco': ('%|@%c\n%c', 0, 1),
+ 'mkfuncdeco0': ('%|def %c\n', 0),
+ 'classdefdeco': ('%c', 0),
+ 'classdefdeco1': ('\n\n%|@%c%c', 0, 1),
+ 'kwarg': ('%[0]{pattr}=%c', 1),
+ 'importlist2': ('%C', (0, sys.maxint, ', ')),
+ 'assert': ('%|assert %c\n', 0),
+ 'assert2': ('%|assert %c, %c\n', 0, 3),
+ 'assert_expr_or': ('%c or %c', 0, 2),
+ 'assert_expr_and': ('%c and %c', 0, 2),
+ 'print_items_stmt': ('%|print %c%c,\n', 0, 2),
+ 'print_items_nl_stmt': ('%|print %c%c\n', 0, 2),
+ 'print_item': (', %c', 0),
+ 'print_nl': ('%|print\n',),
+ 'print_to': ('%|print >> %c, %c,\n', 0, 1),
+ 'print_to_nl': ('%|print >> %c, %c\n', 0, 1),
+ 'print_nl_to': ('%|print >> %c\n', 0),
+ 'print_to_items': ('%C', (0, 2, ', ')),
+ 'call_stmt': ('%|%p\n', (0, 200)),
+ 'break_stmt': ('%|break\n',),
+ 'continue_stmt': ('%|continue\n',),
+ 'raise_stmt0': ('%|raise\n',),
+ 'raise_stmt1': ('%|raise %c\n', 0),
+ 'raise_stmt2': ('%|raise %c, %c\n', 0, 1),
+ 'raise_stmt3': ('%|raise %c, %c, %c\n',
+                 0,
+                 1,
+                 2),
+ 'ifstmt': ('%|if %c:\n%+%c%-', 0, 1),
+ 'iflaststmt': ('%|if %c:\n%+%c%-', 0, 1),
+ 'iflaststmtl': ('%|if %c:\n%+%c%-', 0, 1),
+ 'testtrue': ('not %p', (0, 22)),
+ 'ifelsestmt': ('%|if %c:\n%+%c%-%|else:\n%+%c%-',
+                0,
+                1,
+                3),
+ 'ifelsestmtc': ('%|if %c:\n%+%c%-%|else:\n%+%c%-',
+                 0,
+                 1,
+                 3),
+ 'ifelsestmtl': ('%|if %c:\n%+%c%-%|else:\n%+%c%-',
+                 0,
+                 1,
+                 3),
+ 'ifelifstmt': ('%|if %c:\n%+%c%-%c',
+                0,
+                1,
+                3),
+ 'elifelifstmt': ('%|elif %c:\n%+%c%-%c',
+                  0,
+                  1,
+                  3),
+ 'elifstmt': ('%|elif %c:\n%+%c%-', 0, 1),
+ 'elifelsestmt': ('%|elif %c:\n%+%c%-%|else:\n%+%c%-',
+                  0,
+                  1,
+                  3),
+ 'ifelsestmtr': ('%|if %c:\n%+%c%-%|else:\n%+%c%-',
+                 0,
+                 1,
+                 2),
+ 'elifelsestmtr': ('%|elif %c:\n%+%c%-%|else:\n%+%c%-\n\n',
+                   0,
+                   1,
+                   2),
+ 'whilestmt': ('%|while %c:\n%+%c%-\n\n', 1, 2),
+ 'while1stmt': ('%|while 1:\n%+%c%-\n\n', 1),
+ 'while1elsestmt': ('%|while 1:\n%+%c%-%|else:\n%+%c%-\n\n', 1, 3),
+ 'whileelsestmt': ('%|while %c:\n%+%c%-%|else:\n%+%c%-\n\n',
+                   1,
+                   2,
+                   -2),
+ 'whileelselaststmt': ('%|while %c:\n%+%c%-%|else:\n%+%c%-',
+                       1,
+                       2,
+                       -2),
+ 'forstmt': ('%|for %c in %c:\n%+%c%-\n\n',
+             3,
+             1,
+             4),
+ 'forelsestmt': ('%|for %c in %c:\n%+%c%-%|else:\n%+%c%-\n\n',
+                 3,
+                 1,
+                 4,
+                 -2),
+ 'forelselaststmt': ('%|for %c in %c:\n%+%c%-%|else:\n%+%c%-',
+                     3,
+                     1,
+                     4,
+                     -2),
+ 'forelselaststmtl': ('%|for %c in %c:\n%+%c%-%|else:\n%+%c%-\n\n',
+                      3,
+                      1,
+                      4,
+                      -2),
+ 'trystmt': ('%|try:\n%+%c%-%c\n\n', 1, 3),
+ 'tryelsestmt': ('%|try:\n%+%c%-%c%|else:\n%+%c%-\n\n',
+                 1,
+                 3,
+                 4),
+ 'tryelsestmtc': ('%|try:\n%+%c%-%c%|else:\n%+%c%-',
+                  1,
+                  3,
+                  4),
+ 'tryelsestmtl': ('%|try:\n%+%c%-%c%|else:\n%+%c%-',
+                  1,
+                  3,
+                  4),
+ 'tf_trystmt': ('%c%-%c%+', 1, 3),
+ 'tf_tryelsestmt': ('%c%-%c%|else:\n%+%c',
+                    1,
+                    3,
+                    4),
+ 'except': ('%|except:\n%+%c%-', 3),
+ 'except_cond1': ('%|except %c:\n', 1),
+ 'except_cond2': ('%|except %c as %c:\n', 1, 5),
+ 'except_suite': ('%+%c%-%C', 0, (1, sys.maxint, '')),
+ 'tryfinallystmt': ('%|try:\n%+%c%-%|finally:\n%+%c%-\n\n', 1, 5),
+ 'withstmt': ('%|with %c:\n%+%c%-', 0, 3),
+ 'withasstmt': ('%|with %c as %c:\n%+%c%-',
+                0,
+                2,
+                3),
+ 'passstmt': ('%|pass\n',),
+ 'STORE_FAST': ('%{pattr}',),
+ 'kv': ('%c: %c', 3, 1),
+ 'kv2': ('%c: %c', 1, 2),
+ 'mapexpr': ('{%[1]C}', (0, sys.maxint, ', ')),
+ 'importstmt': ('%|import %c\n', 2),
+ 'importstar': ('%|from %[2]{pattr} import *\n',),
+ 'importfrom': ('%|from %[2]{pattr} import %c\n', 3),
+ 'importmultiple': ('%|import %c%c\n', 2, 3),
+ 'import_cont': (', %c', 2),
+ 'assign2': ('%|%c, %c = %c, %c\n',
+             3,
+             4,
+             0,
+             1),
+ 'assign3': ('%|%c, %c, %c = %c, %c, %c\n',
+             5,
+             6,
+             7,
+             0,
+             1,
+             2)}
+MAP_DIRECT = (TABLE_DIRECT,)
+MAP_R0 = (TABLE_R0, -1, 0)
+MAP_R = (TABLE_R, -1)
+MAP = {'stmt': MAP_R,
+ 'call_function': MAP_R,
+ 'del_stmt': MAP_R,
+ 'designator': MAP_R,
+ 'exprlist': MAP_R0}
+PRECEDENCE = {'build_list': 0,
+ 'mapexpr': 0,
+ 'unary_convert': 0,
+ 'dictcomp': 0,
+ 'setcomp': 0,
+ 'list_compr': 0,
+ 'genexpr': 0,
+ 'load_attr': 2,
+ 'binary_subscr': 2,
+ 'binary_subscr2': 2,
+ 'slice0': 2,
+ 'slice1': 2,
+ 'slice2': 2,
+ 'slice3': 2,
+ 'buildslice2': 2,
+ 'buildslice3': 2,
+ 'call_function': 2,
+ 'BINARY_POWER': 4,
+ 'unary_expr': 6,
+ 'BINARY_MULTIPLY': 8,
+ 'BINARY_DIVIDE': 8,
+ 'BINARY_TRUE_DIVIDE': 8,
+ 'BINARY_FLOOR_DIVIDE': 8,
+ 'BINARY_MODULO': 8,
+ 'BINARY_ADD': 10,
+ 'BINARY_SUBTRACT': 10,
+ 'BINARY_LSHIFT': 12,
+ 'BINARY_RSHIFT': 12,
+ 'BINARY_AND': 14,
+ 'BINARY_XOR': 16,
+ 'BINARY_OR': 18,
+ 'cmp': 20,
+ 'unary_not': 22,
+ 'and': 24,
+ 'ret_and': 24,
+ 'or': 26,
+ 'ret_or': 26,
+ 'conditional': 28,
+ 'conditionalnot': 28,
+ 'ret_cond': 28,
+ 'ret_cond_not': 28,
+ '_mklambda': 30,
+ 'yield': 101}
+ASSIGN_TUPLE_PARAM = lambda param_name: AST('expr', [Token('LOAD_FAST', pattr=param_name)])
+escape = re.compile('\n            (?P<prefix> [^%]* )\n            % ( \\[ (?P<child> -? \\d+ ) \\] )?\n                ((?P<type> [^{] ) |\n                 ( [{] (?P<expr> [^}]* ) [}] ))\n        ', re.VERBOSE)
+
+class ParserError0(Exception):
+
+    def __init__(self, token, offset):
+        self.token = token
+        self.offset = offset
+
+    def __str__(self):
+        return "Syntax error at or near `%r' token at offset %s" % (self.token, self.offset)
+
+
+class ParserError(ParserError0):
+
+    def __init__(self, error, tokens):
+        self.error = error
+        self.tokens = tokens
+
+    def __str__(self):
+        lines = ['--- This code section failed: ---']
+        lines.extend(map(str, self.tokens))
+        lines.extend(['', str(self.error)])
+        return '\n'.join(lines)
+
+
+def find_globals(node, globs):
+    """Find globals in this statement."""
+    for n in node:
+        if isinstance(n, AST):
+            globs = find_globals(n, globs)
+        elif n.type in ('STORE_GLOBAL', 'DELETE_GLOBAL'):
+            globs.add(n.pattr)
+
+    return globs
+
+
+def find_all_globals(node, globs):
+    """Find globals in this statement."""
+    for n in node:
+        if isinstance(n, AST):
+            globs = find_all_globals(n, globs)
+        elif n.type in ('STORE_GLOBAL', 'DELETE_GLOBAL', 'LOAD_GLOBAL'):
+            globs.add(n.pattr)
+
+    return globs
+
+
+def find_none(node):
+    for n in node:
+        if isinstance(n, AST):
+            if not (n == 'return_stmt' or n == 'return_if_stmt'):
+                if find_none(n):
+                    return True
+        elif n.type == 'LOAD_CONST' and n.pattr == None:
+            return True
+
+    return False
+
+
+class GenericASTTraversal():
+
+    def __init__(self, ast):
+        self.ast = ast
+
+    def typestring(self, node):
+        return node.type
+
+    def prune(self):
+        raise GenericASTTraversalPruningException
+
+    def preorder(self, node = None):
+        if node is None:
+            node = self.ast
+        try:
+            name = 'n_' + self.typestring(node)
+            if hasattr(self, name):
+                func = getattr(self, name)
+                func(node)
+            else:
+                self.default(node)
+        except GenericASTTraversalPruningException:
+            return
+
+        for kid in node:
+            self.preorder(kid)
+
+        name = name + '_exit'
+        if hasattr(self, name):
+            func = getattr(self, name)
+            func(node)
+
+    def default(self, node):
+        pass
+
+
+class Walker(GenericASTTraversal, object):
+    stacked_params = ('f', 'indent', 'isLambda', '_globals')
+
+    def __init__(self, out, scanner, showast = 0):
+        GenericASTTraversal.__init__(self, ast=None)
+        self.scanner = scanner
+        params = {'f': out,
+         'indent': ''}
+        self.showast = showast
+        self.__params = params
+        self.__param_stack = []
+        self.ERROR = None
+        self.prec = 100
+        self.return_none = False
+        self.mod_globs = set()
+        self.currentclass = None
+        self.pending_newlines = 0
+
+    f = property(lambda s: s.__params['f'], lambda s, x: s.__params.__setitem__('f', x), lambda s: s.__params.__delitem__('f'), None)
+    indent = property(lambda s: s.__params['indent'], lambda s, x: s.__params.__setitem__('indent', x), lambda s: s.__params.__delitem__('indent'), None)
+    isLambda = property(lambda s: s.__params['isLambda'], lambda s, x: s.__params.__setitem__('isLambda', x), lambda s: s.__params.__delitem__('isLambda'), None)
+    _globals = property(lambda s: s.__params['_globals'], lambda s, x: s.__params.__setitem__('_globals', x), lambda s: s.__params.__delitem__('_globals'), None)
+
+    def indentMore(self, indent = TAB):
+        self.indent += indent
+
+    def indentLess(self, indent = TAB):
+        self.indent = self.indent[:-len(indent)]
+
+    def traverse(self, node, indent = None, isLambda = 0):
+        self.__param_stack.append(self.__params)
+        if indent is None:
+            indent = self.indent
+        p = self.pending_newlines
+        self.pending_newlines = 0
+        self.__params = {'_globals': {},
+         'f': cStringIO.StringIO(),
+         'indent': indent,
+         'isLambda': isLambda}
+        self.preorder(node)
+        self.f.write('\n' * self.pending_newlines)
+        result = self.f.getvalue()
+        self.__params = self.__param_stack.pop()
+        self.pending_newlines = p
+        return result
+
+    def write(self, *data):
+        if len(data) == 0 or len(data) == 1 and data[0] == '':
+            return
+        out = ''.join((str(j) for j in data))
+        n = 0
+        for i in out:
+            if i == '\n':
+                n += 1
+                if n == len(out):
+                    self.pending_newlines = max(self.pending_newlines, n)
+                    return
+            elif n:
+                self.pending_newlines = max(self.pending_newlines, n)
+                out = out[n:]
+                break
+            else:
+                break
+
+        if self.pending_newlines > 0:
+            self.f.write('\n' * self.pending_newlines)
+            self.pending_newlines = 0
+        for i in out[::-1]:
+            if i == '\n':
+                self.pending_newlines += 1
+            else:
+                break
+
+        if self.pending_newlines:
+            out = out[:-self.pending_newlines]
+        self.f.write(out)
+
+    def print_(self, *data):
+        if data and not (len(data) == 1 and data[0] == ''):
+            self.write(*data)
+        self.pending_newlines = max(self.pending_newlines, 1)
+
+    def print_docstring(self, indent, docstring):
+        quote = '"""'
+        self.write(indent)
+        if type(docstring) == unicode:
+            self.write('u')
+            docstring = repr(docstring.expandtabs())[2:-1]
+        else:
+            docstring = repr(docstring.expandtabs())[1:-1]
+        for orig, replace in (('\\\\', '\t'),
+         ('\\r\\n', '\n'),
+         ('\\n', '\n'),
+         ('\\r', '\n'),
+         ('\\"', '"'),
+         ("\\'", "'")):
+            docstring = docstring.replace(orig, replace)
+
+        if '\t' in docstring and '\\' not in docstring and len(docstring) >= 2 and docstring[-1] != '\t' and (docstring[-1] != '"' or docstring[-2] == '\t'):
+            self.write('r')
+            docstring = docstring.replace('\t', '\\')
+        else:
+            if len(docstring) and docstring[-1] == '"':
+                docstring = docstring[:-1] + '\\"'
+            docstring = docstring.replace('"""', '\\"\\"\\"')
+            docstring = docstring.replace('\t', '\\\\')
+        lines = docstring.split('\n')
+        calculate_indent = sys.maxint
+        for line in lines[1:]:
+            stripped = line.lstrip()
+            if len(stripped) > 0:
+                calculate_indent = min(calculate_indent, len(line) - len(stripped))
+
+        calculate_indent = min(calculate_indent, len(lines[-1]) - len(lines[-1].lstrip()))
+        trimmed = [lines[0]]
+        if calculate_indent < sys.maxint:
+            trimmed += [ line[calculate_indent:] for line in lines[1:] ]
+        self.write(quote)
+        if len(trimmed) == 0:
+            self.print_(quote)
+        elif len(trimmed) == 1:
+            self.print_(trimmed[0], quote)
+        else:
+            self.print_(trimmed[0])
+            for line in trimmed[1:-1]:
+                self.print_(indent, line)
+
+            self.print_(indent, trimmed[-1], quote)
+
+    def n_return_stmt(self, node):
+        if self.__params['isLambda']:
+            self.preorder(node[0])
+            self.prune()
+        else:
+            self.write(self.indent, 'return')
+            if self.return_none or node != AST('return_stmt', [AST('ret_expr', [NONE]), Token('RETURN_VALUE')]):
+                self.write(' ')
+                self.preorder(node[0])
+            self.print_()
+            self.prune()
+
+    def n_return_if_stmt(self, node):
+        if self.__params['isLambda']:
+            self.preorder(node[0])
+            self.prune()
+        else:
+            self.write(self.indent, 'return')
+            if self.return_none or node != AST('return_stmt', [AST('ret_expr', [NONE]), Token('RETURN_END_IF')]):
+                self.write(' ')
+                self.preorder(node[0])
+            self.print_()
+            self.prune()
+
+    def n_yield(self, node):
+        self.write('yield')
+        if node != AST('yield', [NONE, Token('YIELD_VALUE')]):
+            self.write(' ')
+            self.preorder(node[0])
+        self.prune()
+
+    def n_buildslice3(self, node):
+        p = self.prec
+        self.prec = 100
+        if node[0] != NONE:
+            self.preorder(node[0])
+        self.write(':')
+        if node[1] != NONE:
+            self.preorder(node[1])
+        self.write(':')
+        if node[2] != NONE:
+            self.preorder(node[2])
+        self.prec = p
+        self.prune()
+
+    def n_buildslice2(self, node):
+        p = self.prec
+        self.prec = 100
+        if node[0] != NONE:
+            self.preorder(node[0])
+        self.write(':')
+        if node[1] != NONE:
+            self.preorder(node[1])
+        self.prec = p
+        self.prune()
+
+    def n_expr(self, node):
+        p = self.prec
+        if node[0].type.startswith('binary_expr'):
+            n = node[0][-1][0]
+        else:
+            n = node[0]
+        self.prec = PRECEDENCE.get(n, -2)
+        if n == 'LOAD_CONST' and repr(n.pattr)[0] == '-':
+            self.prec = 6
+        if p < self.prec:
+            self.write('(')
+            self.preorder(node[0])
+            self.write(')')
+        else:
+            self.preorder(node[0])
+        self.prec = p
+        self.prune()
+
+    def n_ret_expr(self, node):
+        if len(node) == 1 and node[0] == 'expr':
+            self.n_expr(node[0])
+        else:
+            self.n_expr(node)
+
+    n_ret_expr_or_cond = n_expr
+
+    def n_binary_expr(self, node):
+        self.preorder(node[0])
+        self.write(' ')
+        self.preorder(node[-1])
+        self.write(' ')
+        self.prec -= 1
+        self.preorder(node[1])
+        self.prec += 1
+        self.prune()
+
+    def n_LOAD_CONST(self, node):
+        data = node.pattr
+        datatype = type(data)
+        if datatype is IntType and data == minint:
+            self.write(hex(data))
+        elif datatype is EllipsisType:
+            self.write('...')
+        elif data is None:
+            self.write('None')
+        else:
+            self.write(repr(data))
+        self.prune()
+
+    def n_delete_subscr(self, node):
+        if node[-2][0] == 'build_list' and node[-2][0][-1].type.startswith('BUILD_TUPLE'):
+            if node[-2][0][-1] != 'BUILD_TUPLE_0':
+                node[-2][0].type = 'build_tuple2'
+        self.default(node)
+
+    n_store_subscr = n_binary_subscr = n_delete_subscr
+
+    def n_tryfinallystmt(self, node):
+        if len(node[1][0]) == 1 and node[1][0][0] == 'stmt':
+            if node[1][0][0][0] == 'trystmt':
+                node[1][0][0][0].type = 'tf_trystmt'
+            if node[1][0][0][0] == 'tryelsestmt':
+                node[1][0][0][0].type = 'tf_tryelsestmt'
+        self.default(node)
+
+    def n_exec_stmt(self, node):
+        """
+        exec_stmt ::= expr exprlist DUP_TOP EXEC_STMT
+        exec_stmt ::= expr exprlist EXEC_STMT
+        """
+        self.write(self.indent, 'exec ')
+        self.preorder(node[0])
+        if node[1][0] != NONE:
+            sep = ' in '
+            for subnode in node[1]:
+                self.write(sep)
+                sep = ', '
+                self.preorder(subnode)
+
+        self.print_()
+        self.prune()
+
+    def n_ifelsestmt(self, node, preprocess = 0):
+        n = node[3][0]
+        if len(n) == 1 == len(n[0]) and n[0] == '_stmts':
+            n = n[0][0][0]
+        elif n[0].type in ('lastc_stmt', 'lastl_stmt'):
+            n = n[0][0]
+        else:
+            if not preprocess:
+                self.default(node)
+            return
+        if n.type in ('ifstmt', 'iflaststmt', 'iflaststmtl'):
+            node.type = 'ifelifstmt'
+            n.type = 'elifstmt'
+        elif n.type in ('ifelsestmtr',):
+            node.type = 'ifelifstmt'
+            n.type = 'elifelsestmtr'
+        elif n.type in ('ifelsestmt', 'ifelsestmtc', 'ifelsestmtl'):
+            node.type = 'ifelifstmt'
+            self.n_ifelsestmt(n, preprocess=1)
+            if n == 'ifelifstmt':
+                n.type = 'elifelifstmt'
+            elif n.type in ('ifelsestmt', 'ifelsestmtc', 'ifelsestmtl'):
+                n.type = 'elifelsestmt'
+        if not preprocess:
+            self.default(node)
+
+    n_ifelsestmtc = n_ifelsestmtl = n_ifelsestmt
+
+    def n_ifelsestmtr(self, node):
+        if len(node[2]) != 2:
+            self.default(node)
+        if not (node[2][0][0][0] == 'ifstmt' and node[2][0][0][0][1][0] == 'return_if_stmts') and not (node[2][0][-1][0] == 'ifstmt' and node[2][0][-1][0][1][0] == 'return_if_stmts'):
+            self.default(node)
+            return
+        self.write(self.indent, 'if ')
+        self.preorder(node[0])
+        self.print_(':')
+        self.indentMore()
+        self.preorder(node[1])
+        self.indentLess()
+        if_ret_at_end = False
+        if len(node[2][0]) >= 3:
+            if node[2][0][-1][0] == 'ifstmt' and node[2][0][-1][0][1][0] == 'return_if_stmts':
+                if_ret_at_end = True
+        past_else = False
+        prev_stmt_is_if_ret = True
+        for n in node[2][0]:
+            if n[0] == 'ifstmt' and n[0][1][0] == 'return_if_stmts':
+                if prev_stmt_is_if_ret:
+                    n[0].type = 'elifstmt'
+                prev_stmt_is_if_ret = True
+            else:
+                prev_stmt_is_if_ret = False
+                if not past_else and not if_ret_at_end:
+                    self.print_(self.indent, 'else:')
+                    self.indentMore()
+                    past_else = True
+            self.preorder(n)
+
+        if not past_else or if_ret_at_end:
+            self.print_(self.indent, 'else:')
+            self.indentMore()
+        self.preorder(node[2][1])
+        self.indentLess()
+        self.prune()
+
+    def n_elifelsestmtr(self, node):
+        if len(node[2]) != 2:
+            self.default(node)
+        for n in node[2][0]:
+            if not (n[0] == 'ifstmt' and n[0][1][0] == 'return_if_stmts'):
+                self.default(node)
+                return
+
+        self.write(self.indent, 'elif ')
+        self.preorder(node[0])
+        self.print_(':')
+        self.indentMore()
+        self.preorder(node[1])
+        self.indentLess()
+        if_ret_at_end = False
+        if len(node[2][0]) >= 3:
+            if node[2][0][-1][0] == 'ifstmt' and node[2][0][-1][0][1][0] == 'return_if_stmts':
+                if_ret_at_end = True
+        past_else = False
+        prev_stmt_is_if_ret = True
+        for n in node[2][0]:
+            n[0].type = 'elifstmt'
+            self.preorder(n)
+
+        self.print_(self.indent, 'else:')
+        self.indentMore()
+        self.preorder(node[2][1])
+        self.indentLess()
+        self.prune()
+
+    def n_import_as(self, node):
+        iname = node[0].pattr
+        assert node[-1][-1].type.startswith('STORE_')
+        sname = node[-1][-1].pattr
+        if iname == sname or iname.startswith(sname + '.'):
+            self.write(iname)
+        else:
+            self.write(iname, ' as ', sname)
+        self.prune()
+
+    n_import_as_cont = n_import_as
+
+    def n_importfrom(self, node):
+        if node[0].pattr > 0:
+            node[2].pattr = '.' * node[0].pattr + node[2].pattr
+        self.default(node)
+
+    n_importstar = n_importfrom
+
+    def n_mkfunc(self, node):
+        self.write(node[-2].attr.co_name)
+        self.indentMore()
+        self.make_function(node, isLambda=0)
+        if len(self.__param_stack) > 1:
+            self.write('\n\n')
+        else:
+            self.write('\n\n\n')
+        self.indentLess()
+        self.prune()
+
+    def n_mklambda(self, node):
+        self.make_function(node, isLambda=1)
+        self.prune()
+
+    def n_list_compr(self, node):
+        p = self.prec
+        self.prec = 27
+        n = node[-1]
+        assert n == 'list_iter'
+        while n == 'list_iter':
+            n = n[0]
+            if n == 'list_for':
+                n = n[3]
+            elif n == 'list_if':
+                n = n[2]
+            elif n == 'list_if_not':
+                n = n[2]
+
+        assert n == 'lc_body'
+        self.write('[ ')
+        self.preorder(n[0])
+        self.preorder(node[-1])
+        self.write(' ]')
+        self.prec = p
+        self.prune()
+
+    def comprehension_walk(self, node, iter_index):
+        p = self.prec
+        self.prec = 27
+        code = node[-5].attr
+        assert type(code) == CodeType
+        code = Code(code, self.scanner, self.currentclass)
+        ast = self.build_ast(code._tokens, code._customize)
+        self.customize(code._customize)
+        ast = ast[0][0][0]
+        n = ast[iter_index]
+        assert n == 'comp_iter'
+        while n == 'comp_iter':
+            n = n[0]
+            if n == 'comp_for':
+                n = n[3]
+            elif n == 'comp_if':
+                n = n[2]
+            elif n == 'comp_ifnot':
+                n = n[2]
+
+        assert n == 'comp_body', ast
+        self.preorder(n[0])
+        self.write(' for ')
+        self.preorder(ast[iter_index - 1])
+        self.write(' in ')
+        self.preorder(node[-3])
+        self.preorder(ast[iter_index])
+        self.prec = p
+
+    def n_genexpr(self, node):
+        self.write('(')
+        self.comprehension_walk(node, 3)
+        self.write(')')
+        self.prune()
+
+    def n_setcomp(self, node):
+        self.write('{')
+        self.comprehension_walk(node, 4)
+        self.write('}')
+        self.prune()
+
+    n_dictcomp = n_setcomp
+
+    def n_classdef(self, node):
+        cclass = self.currentclass
+        self.currentclass = str(node[0].pattr)
+        self.write('\n\n')
+        self.write(self.indent, 'class ', self.currentclass)
+        self.print_super_classes(node)
+        self.print_(':')
+        self.indentMore()
+        self.build_class(node[2][-2].attr)
+        self.indentLess()
+        self.currentclass = cclass
+        if len(self.__param_stack) > 1:
+            self.write('\n\n')
+        else:
+            self.write('\n\n\n')
+        self.prune()
+
+    n_classdefdeco2 = n_classdef
+
+    def print_super_classes(self, node):
+        node = node[1][0]
+        if not node == 'build_list':
+            return
+        self.write('(')
+        line_separator = ', '
+        sep = ''
+        for elem in node[:-1]:
+            value = self.traverse(elem)
+            self.write(sep, value)
+            sep = line_separator
+
+        self.write(')')
+
+    def n_mapexpr(self, node):
+        """
+        prettyprint a mapexpr
+        'mapexpr' is something like k = {'a': 1, 'b': 42 }"
+        """
+        p = self.prec
+        self.prec = 100
+        assert node[-1] == 'kvlist'
+        node = node[-1]
+        self.indentMore(INDENT_PER_LEVEL)
+        line_seperator = ',\n' + self.indent
+        sep = INDENT_PER_LEVEL[:-1]
+        self.write('{')
+        for kv in node:
+            assert kv in ('kv', 'kv2', 'kv3')
+            if kv == 'kv':
+                name = self.traverse(kv[-2], indent='')
+                value = self.traverse(kv[1], indent=self.indent + (len(name) + 2) * ' ')
+            elif kv == 'kv2':
+                name = self.traverse(kv[1], indent='')
+                value = self.traverse(kv[-3], indent=self.indent + (len(name) + 2) * ' ')
+            elif kv == 'kv3':
+                name = self.traverse(kv[-2], indent='')
+                value = self.traverse(kv[0], indent=self.indent + (len(name) + 2) * ' ')
+            self.write(sep, name, ': ', value)
+            sep = line_seperator
+
+        self.write('}')
+        self.indentLess(INDENT_PER_LEVEL)
+        self.prec = p
+        self.prune()
+
+    def n_build_list(self, node):
+        """
+        prettyprint a list or tuple
+        """
+        p = self.prec
+        self.prec = 100
+        lastnode = node.pop()
+        lastnodetype = lastnode.type
+        if lastnodetype.startswith('BUILD_LIST'):
+            self.write('[')
+            endchar = ']'
+        elif lastnodetype.startswith('BUILD_TUPLE'):
+            self.write('(')
+            endchar = ')'
+        elif lastnodetype.startswith('BUILD_SET'):
+            self.write('{')
+            endchar = '}'
+        elif lastnodetype.startswith('ROT_TWO'):
+            self.write('(')
+            endchar = ')'
+        else:
+            raise Exception('Internal Error: n_build_list expects list or tuple')
+        flat_elems = []
+        for elem in node:
+            if elem == 'expr1024':
+                for subelem in elem:
+                    for subsubelem in subelem:
+                        flat_elems.append(subsubelem)
+
+            elif elem == 'expr32':
+                for subelem in elem:
+                    flat_elems.append(subelem)
+
+            else:
+                flat_elems.append(elem)
+
+        self.indentMore(INDENT_PER_LEVEL)
+        if lastnode.attr > 3:
+            line_separator = ',\n' + self.indent
+        else:
+            line_separator = ', '
+        sep = INDENT_PER_LEVEL[:-1]
+        for elem in flat_elems:
+            if elem == 'ROT_THREE':
+                continue
+            assert elem == 'expr'
+            value = self.traverse(elem)
+            self.write(sep, value)
+            sep = line_separator
+
+        if lastnode.attr == 1 and lastnodetype.startswith('BUILD_TUPLE'):
+            self.write(',')
+        self.write(endchar)
+        self.indentLess(INDENT_PER_LEVEL)
+        self.prec = p
+        self.prune()
+
+    def n_unpack(self, node):
+        for n in node[1:]:
+            if n[0].type == 'unpack':
+                n[0].type = 'unpack_w_parens'
+
+        self.default(node)
+
+    n_unpack_w_parens = n_unpack
+
+    def n_assign2(self, node):
+        for n in node[-2:]:
+            if n[0] == 'unpack':
+                n[0].type = 'unpack_w_parens'
+
+        self.default(node)
+
+    def n_assign3(self, node):
+        for n in node[-3:]:
+            if n[0] == 'unpack':
+                n[0].type = 'unpack_w_parens'
+
+        self.default(node)
+
+    def n_except_cond2(self, node):
+        if node[5][0] == 'unpack':
+            node[5][0].type = 'unpack_w_parens'
+        self.default(node)
+
+    def engine(self, entry, startnode):
+        fmt = entry[0]
+        arg = 1
+        i = 0
+        m = escape.search(fmt)
+        while m:
+            i = m.end()
+            self.write(m.group('prefix'))
+            typ = m.group('type') or '{'
+            node = startnode
+            try:
+                if m.group('child'):
+                    node = node[int(m.group('child'))]
+            except:
+                print node.__dict__
+                raise
+
+            if typ == '%':
+                self.write('%')
+            elif typ == '+':
+                self.indentMore()
+            elif typ == '-':
+                self.indentLess()
+            elif typ == '|':
+                self.write(self.indent)
+            elif typ == ',':
+                if lastC == 1:
+                    self.write(',')
+            elif typ == 'c':
+                self.preorder(node[entry[arg]])
+                arg += 1
+            elif typ == 'p':
+                p = self.prec
+                index, self.prec = entry[arg]
+                self.preorder(node[index])
+                self.prec = p
+                arg += 1
+            elif typ == 'C':
+                low, high, sep = entry[arg]
+                lastC = remaining = len(node[low:high])
+                for subnode in node[low:high]:
+                    self.preorder(subnode)
+                    remaining -= 1
+                    if remaining > 0:
+                        self.write(sep)
+
+                arg += 1
+            elif typ == 'P':
+                p = self.prec
+                low, high, sep, self.prec = entry[arg]
+                lastC = remaining = len(node[low:high])
+                for subnode in node[low:high]:
+                    self.preorder(subnode)
+                    remaining -= 1
+                    if remaining > 0:
+                        self.write(sep)
+
+                self.prec = p
+                arg += 1
+            elif typ == '{':
+                d = node.__dict__
+                expr = m.group('expr')
+                try:
+                    self.write(eval(expr, d, d))
+                except:
+                    print node
+                    raise
+
+            m = escape.search(fmt, i)
+
+        self.write(fmt[i:])
+
+    def default(self, node):
+        mapping = MAP.get(node, MAP_DIRECT)
+        table = mapping[0]
+        key = node
+        for i in mapping[1:]:
+            key = key[i]
+
+        if table.has_key(key):
+            self.engine(table[key], node)
+            self.prune()
+
+    def customize(self, customize):
+        """
+        Special handling for opcodes that take a variable number
+        of arguments -- we add a new entry for each in TABLE_R.
+        """
+        for k, v in customize.items():
+            if TABLE_R.has_key(k):
+                continue
+            op = k[:k.rfind('_')]
+            if op == 'CALL_FUNCTION':
+                TABLE_R[k] = ('%c(%P)', 0, (1, -1, ', ', 100))
+            elif op in ('CALL_FUNCTION_VAR', 'CALL_FUNCTION_VAR_KW', 'CALL_FUNCTION_KW'):
+                if v == 0:
+                    str = '%c(%C'
+                    p2 = (0, 0, None)
+                else:
+                    str = '%c(%C, '
+                    p2 = (1, -2, ', ')
+                if op == 'CALL_FUNCTION_VAR':
+                    str += '*%c)'
+                    entry = (str,
+                     0,
+                     p2,
+                     -2)
+                elif op == 'CALL_FUNCTION_KW':
+                    str += '**%c)'
+                    entry = (str,
+                     0,
+                     p2,
+                     -2)
+                else:
+                    str += '*%c, **%c)'
+                    if p2[2]:
+                        p2 = (1, -3, ', ')
+                    entry = (str,
+                     0,
+                     p2,
+                     -3,
+                     -2)
+                TABLE_R[k] = entry
+
+    def get_tuple_parameter(self, ast, name):
+        """
+        If the name of the formal parameter starts with dot,
+        it's a tuple parameter, like this:
+        #          def MyFunc(xx, (a,b,c), yy):
+        #                  print a, b*2, c*42
+        In byte-code, the whole tuple is assigned to parameter '.1' and
+        then the tuple gets unpacked to 'a', 'b' and 'c'.
+        
+        Since identifiers starting with a dot are illegal in Python,
+        we can search for the byte-code equivalent to '(a,b,c) = .1'
+        """
+        assert ast == 'stmts'
+        for i in range(len(ast)):
+            assert ast[i][0] == 'stmt'
+            node = ast[i][0][0]
+            if node == 'assign' and node[0] == ASSIGN_TUPLE_PARAM(name):
+                del ast[i]
+                assert node[1] == 'designator'
+                return '(' + self.traverse(node[1]) + ')'
+
+        raise "Can't find tuple parameter" % name
+
+    def make_function(self, node, isLambda, nested = 1):
+        """Dump function defintion, doc string, and function body."""
+
+        def build_param(ast, name, default):
+            """build parameters:
+                - handle defaults
+                - handle format tuple parameters
+            """
+            if name.startswith('.'):
+                name = self.get_tuple_parameter(ast, name)
+            if default:
+                if self.showast:
+                    print '--', name
+                    print default
+                    print '--'
+                result = '%s = %s' % (name, self.traverse(default, indent=''))
+                if result[-2:] == '= ':
+                    result += 'None'
+                return result
+            else:
+                return name
+
+        defparams = node[:node[-1].attr]
+        code = node[-2].attr
+        assert type(code) == CodeType
+        code = Code(code, self.scanner, self.currentclass)
+        argc = code.co_argcount
+        paramnames = list(code.co_varnames[:argc])
+        paramnames.reverse()
+        defparams.reverse()
+        try:
+            ast = self.build_ast(code._tokens, code._customize, isLambda=isLambda, noneInNames='None' in code.co_names)
+        except ParserError as p:
+            self.write(str(p))
+            self.ERROR = p
+            return
+
+        params = []
+        for name, default in map(lambda a, b: (a, b), paramnames, defparams):
+            params.append(build_param(ast, name, default))
+
+        params.reverse()
+        if 4 & code.co_flags:
+            params.append('*%s' % code.co_varnames[argc])
+            argc += 1
+        if 8 & code.co_flags:
+            params.append('**%s' % code.co_varnames[argc])
+            argc += 1
+        indent = self.indent
+        if isLambda:
+            self.write('lambda ', ', '.join(params), ': ')
+        else:
+            self.print_('(', ', '.join(params), '):')
+        if len(code.co_consts) > 0 and code.co_consts[0] != None:
+            self.print_docstring(indent, code.co_consts[0])
+        code._tokens = None
+        assert ast == 'stmts'
+        all_globals = find_all_globals(ast, set())
+        for g in all_globals & self.mod_globs | find_globals(ast, set()):
+            self.print_(self.indent, 'global ', g)
+
+        self.mod_globs -= all_globals
+        rn = 'None' in code.co_names and not find_none(ast)
+        self.gen_source(ast, code._customize, isLambda=isLambda, returnNone=rn)
+        code._tokens = None
+        code._customize = None
+
+    def build_class(self, code):
+        """Dump class definition, doc string and class body."""
+        assert type(code) == CodeType
+        code = Code(code, self.scanner, self.currentclass)
+        indent = self.indent
+        ast = self.build_ast(code._tokens, code._customize)
+        code._tokens = None
+        assert ast == 'stmts'
+        if ast[0][0] == NAME_MODULE:
+            del ast[0]
+        if code.co_consts and code.co_consts[0] != None and ast[0][0] == ASSIGN_DOC_STRING(code.co_consts[0]):
+            self.print_docstring(indent, code.co_consts[0])
+            self.print_()
+            del ast[0]
+        if ast[-1][0] == RETURN_LOCALS:
+            del ast[-1]
+        for g in find_globals(ast, set()):
+            self.print_(indent, 'global ', g)
+
+        self.gen_source(ast, code._customize)
+        code._tokens = None
+        code._customize = None
+
+    def gen_source(self, ast, customize, isLambda = 0, returnNone = False):
+        """convert AST to source code"""
+        rn = self.return_none
+        self.return_none = returnNone
+        if len(ast) == 0:
+            self.print_(self.indent, 'pass')
+        else:
+            self.customize(customize)
+            if isLambda:
+                self.write(self.traverse(ast, isLambda=isLambda))
+            else:
+                self.print_(self.traverse(ast, isLambda=isLambda))
+        self.return_none = rn
+
+    def build_ast(self, tokens, customize, isLambda = 0, noneInNames = False):
+        assert type(tokens) == ListType
+        assert isinstance(tokens[0], Token)
+        if isLambda:
+            tokens.append(Token('LAMBDA_MARKER'))
+            try:
+                ast = parse(tokens, customize)
+            except ParserError0 as e:
+                raise ParserError(e, tokens)
+
+            if self.showast:
+                self.print_(repr(ast))
+            return ast
+        if len(tokens) > 2 or len(tokens) == 2 and not noneInNames:
+            if tokens[-1] == Token('RETURN_VALUE'):
+                if tokens[-2] == Token('LOAD_CONST'):
+                    del tokens[-2:]
+                else:
+                    tokens.append(Token('RETURN_LAST'))
+        if len(tokens) == 0:
+            return PASS
+        try:
+            ast = parse(tokens, customize)
+        except ParserError0 as e:
+            raise ParserError(e, tokens)
+
+        if self.showast:
+            self.print_(repr(ast))
+        return ast
+
+
+BIN_OP_FUNCS = {'BINARY_POWER': operator.pow,
+ 'BINARY_MULTIPLY': operator.mul,
+ 'BINARY_DIVIDE': operator.div,
+ 'BINARY_FLOOR_DIVIDE': operator.floordiv,
+ 'BINARY_TRUE_DIVIDE': operator.truediv,
+ 'BINARY_MODULO': operator.mod,
+ 'BINARY_ADD': operator.add,
+ 'BINARY_SUBRACT': operator.sub,
+ 'BINARY_LSHIFT': operator.lshift,
+ 'BINARY_RSHIFT': operator.rshift,
+ 'BINARY_AND': operator.and_,
+ 'BINARY_XOR': operator.xor,
+ 'BINARY_OR': operator.or_}
+JUMP_OPs = None
+
+class VerifyCmpError(Exception):
+    pass
+
+
+class CmpErrorConsts(VerifyCmpError):
+    """Exception to be raised when consts differ."""
+
+    def __init__(self, name, index):
+        self.name = name
+        self.index = index
+
+    def __str__(self):
+        return 'Compare Error within Consts of %s at index %i' % (repr(self.name), self.index)
+
+
+class CmpErrorConstsType(VerifyCmpError):
+    """Exception to be raised when consts differ."""
+
+    def __init__(self, name, index):
+        self.name = name
+        self.index = index
+
+    def __str__(self):
+        return 'Consts type differ in %s at index %i' % (repr(self.name), self.index)
+
+
+class CmpErrorConstsLen(VerifyCmpError):
+    """Exception to be raised when length of co_consts differs."""
+
+    def __init__(self, name, consts1, consts2):
+        self.name = name
+        self.consts = (consts1, consts2)
+
+    def __str__(self):
+        return 'Consts length differs in %s:\n\n%i:\t%s\n\n%i:\t%s\n\n' % (repr(self.name),
+         len(self.consts[0]),
+         `(self.consts[0])`,
+         len(self.consts[1]),
+         `(self.consts[1])`)
+
+
+class CmpErrorCode(VerifyCmpError):
+    """Exception to be raised when code differs."""
+
+    def __init__(self, name, index, token1, token2, tokens1, tokens2):
+        self.name = name
+        self.index = index
+        self.token1 = token1
+        self.token2 = token2
+        self.tokens = [tokens1, tokens2]
+
+    def __str__(self):
+        s = reduce(lambda s, t: '%s%-37s\t%-37s\n' % (s, t[0], t[1]), map(lambda a, b: (a, b), self.tokens[0], self.tokens[1]), 'Code differs in %s\n' % str(self.name))
+        return 'Code differs in %s at offset %s [%s] != [%s]\n\n' % (repr(self.name),
+         self.index,
+         repr(self.token1),
+         repr(self.token2)) + s
+
+
+class CmpErrorCodeLen(VerifyCmpError):
+    """Exception to be raised when code length differs."""
+
+    def __init__(self, name, tokens1, tokens2):
+        self.name = name
+        self.tokens = [tokens1, tokens2]
+
+    def __str__(self):
+        return reduce(lambda s, t: '%s%-37s\t%-37s\n' % (s, t[0], t[1]), map(lambda a, b: (a, b), self.tokens[0], self.tokens[1]), 'Code len differs in %s\n' % str(self.name))
+
+
+class CmpErrorMember(VerifyCmpError):
+    """Exception to be raised when other members differ."""
+
+    def __init__(self, name, member, data1, data2):
+        self.name = name
+        self.member = member
+        self.data = (data1, data2)
+
+    def __str__(self):
+        return 'Member %s differs in %s:\n\t%s\n\t%s\n' % (repr(self.member),
+         repr(self.name),
+         repr(self.data[0]),
+         repr(self.data[1]))
+
+
+__IGNORE_CODE_MEMBERS__ = ['co_filename',
+ 'co_firstlineno',
+ 'co_lnotab',
+ 'co_stacksize',
+ 'co_names']
+
+def cmp_code_objects(version, code_obj1, code_obj2, name = ''):
+    """
+    Compare two code-objects.
+    
+    This is the main part of this module.
+    """
+    global JUMP_OPs
+    assert type(code_obj1) == types.CodeType
+    assert type(code_obj2) == types.CodeType
+    if isinstance(code_obj1, object):
+        assert dir(code_obj1) == dir(code_obj2)
+    else:
+        assert dir(code_obj1) == code_obj1.__members__
+        assert dir(code_obj2) == code_obj2.__members__
+        assert code_obj1.__members__ == code_obj2.__members__
+    if name == '__main__':
+        name = code_obj1.co_name
+    else:
+        name = '%s.%s' % (name, code_obj1.co_name)
+        if name == '.?':
+            name = '__main__'
+    if isinstance(code_obj1, object) and cmp(code_obj1, code_obj2):
+        pass
+    if isinstance(code_obj1, object):
+        members = filter(lambda x: x.startswith('co_'), dir(code_obj1))
+    else:
+        members = dir(code_obj1)
+    members.sort()
+    tokens1 = None
+    for member in members:
+        if member in __IGNORE_CODE_MEMBERS__:
+            pass
+        elif member == 'co_code':
+            scanner = getscanner(version)
+            scanner.setShowAsm(showasm=0)
+            JUMP_OPs = scanner.JUMP_OPs + ['JUMP_BACK']
+            scanner.setTokenClass(Token)
+            try:
+                tokens1, customize = scanner.disassemble(code_obj1)
+                del customize
+                tokens2, customize = scanner.disassemble(code_obj2)
+                del customize
+            finally:
+                scanner.resetTokenClass()
+
+            targets1 = dis.findlabels(code_obj1.co_code)
+            tokens1 = [ t for t in tokens1 if t.type != 'COME_FROM' ]
+            tokens2 = [ t for t in tokens2 if t.type != 'COME_FROM' ]
+            i1 = 0
+            i2 = 0
+            offset_map = {}
+            check_jumps = {}
+            while i1 < len(tokens1):
+                if i2 >= len(tokens2):
+                    if len(tokens1) == len(tokens2) + 2 and tokens1[-1].type == 'RETURN_VALUE' and tokens1[-2].type == 'LOAD_CONST' and tokens1[-2].pattr == None and tokens1[-3].type == 'RETURN_VALUE':
+                        break
+                    else:
+                        raise CmpErrorCodeLen(name, tokens1, tokens2)
+                offset_map[tokens1[i1].offset] = tokens2[i2].offset
+                for idx1, idx2, offset2 in check_jumps.get(tokens1[i1].offset, []):
+                    if offset2 != tokens2[i2].offset:
+                        raise CmpErrorCode(name, tokens1[idx1].offset, tokens1[idx1], tokens2[idx2], tokens1, tokens2)
+
+                if tokens1[i1] != tokens2[i2]:
+                    if tokens1[i1].type == 'LOAD_CONST' == tokens2[i2].type:
+                        i = 1
+                        while tokens1[i1 + i].type == 'LOAD_CONST':
+                            i += 1
+
+                        if tokens1[i1 + i].type.startswith(('BUILD_TUPLE', 'BUILD_LIST')) and i == int(tokens1[i1 + i].type.split('_')[-1]):
+                            t = tuple([ elem.pattr for elem in tokens1[i1:i1 + i] ])
+                            if t != tokens2[i2].pattr:
+                                raise CmpErrorCode(name, tokens1[i1].offset, tokens1[i1], tokens2[i2], tokens1, tokens2)
+                            i1 += i + 1
+                            i2 += 1
+                            continue
+                        elif i == 2 and tokens1[i1 + i].type == 'ROT_TWO' and tokens2[i2 + 1].type == 'UNPACK_SEQUENCE_2':
+                            i1 += 3
+                            i2 += 2
+                            continue
+                        elif i == 2 and tokens1[i1 + i].type in BIN_OP_FUNCS:
+                            f = BIN_OP_FUNCS[tokens1[i1 + i].type]
+                            if f(tokens1[i1].pattr, tokens1[i1 + 1].pattr) == tokens2[i2].pattr:
+                                i1 += 3
+                                i2 += 1
+                                continue
+                        elif i == 1 and tokens1[i1 + i].type == 'STORE_NAME' == tokens2[i2 + i].type and tokens1[i1 + i].pattr == '__doc__' == tokens2[i2 + i].pattr:
+                            i1 += 2
+                            i2 += 2
+                            continue
+                    elif tokens1[i1].type == 'UNARY_NOT':
+                        if tokens2[i2].type == 'POP_JUMP_IF_TRUE':
+                            if tokens1[i1 + 1].type == 'POP_JUMP_IF_FALSE':
+                                i1 += 2
+                                i2 += 1
+                                continue
+                        elif tokens2[i2].type == 'POP_JUMP_IF_FALSE':
+                            if tokens1[i1 + 1].type == 'POP_JUMP_IF_TRUE':
+                                i1 += 2
+                                i2 += 1
+                                continue
+                    elif tokens1[i1].type in ('JUMP_FORWARD', 'JUMP_BACK') and tokens1[i1 - 1].type == 'RETURN_VALUE' and tokens2[i2 - 1].type in ('RETURN_VALUE', 'RETURN_END_IF') and int(tokens1[i1].offset) not in targets1:
+                        i1 += 1
+                        continue
+                    elif tokens1[i1].type == 'JUMP_FORWARD' and tokens2[i2].type == 'JUMP_BACK' and tokens1[i1 + 1].type == 'JUMP_BACK' and tokens2[i2 + 1].type == 'JUMP_BACK' and int(tokens1[i1].pattr) == int(tokens1[i1].offset) + 3:
+                        if int(tokens1[i1].pattr) == int(tokens1[i1 + 1].offset):
+                            i1 += 2
+                            i2 += 2
+                            continue
+                    raise CmpErrorCode(name, tokens1[i1].offset, tokens1[i1], tokens2[i2], tokens1, tokens2)
+                elif tokens1[i1].type in JUMP_OPs and tokens1[i1].pattr != tokens2[i2].pattr:
+                    dest1 = int(tokens1[i1].pattr)
+                    dest2 = int(tokens2[i2].pattr)
+                    if tokens1[i1].type == 'JUMP_BACK':
+                        if offset_map[dest1] != dest2:
+                            raise CmpErrorCode(name, tokens1[i1].offset, tokens1[i1], tokens2[i2], tokens1, tokens2)
+                    elif dest1 in check_jumps:
+                        check_jumps[dest1].append((i1, i2, dest2))
+                    else:
+                        check_jumps[dest1] = [(i1, i2, dest2)]
+                i1 += 1
+                i2 += 1
+
+            del tokens1
+            del tokens2
+        elif member == 'co_consts':
+            codes1 = (c for c in code_obj1.co_consts if type(c) == types.CodeType)
+            codes2 = (c for c in code_obj2.co_consts if type(c) == types.CodeType)
+            for c1, c2 in zip(codes1, codes2):
+                cmp_code_objects(version, c1, c2, name=name)
+
+        elif getattr(code_obj1, member) != getattr(code_obj2, member):
+            raise CmpErrorMember(name, member, getattr(code_obj1, member), getattr(code_obj2, member))
+
+
+def compare_code_with_srcfile(pyc_filename, src_filename):
+    """Compare a .pyc with a source code file."""
+    version, code_obj1 = _load_module(pyc_filename)
+    code_obj2 = _load_file(src_filename)
+    cmp_code_objects(version, code_obj1, code_obj2)
+
+
+def compare_files(pyc_filename1, pyc_filename2):
+    """Compare two .pyc files."""
+    version, code_obj1 = _load_module(pyc_filename1)
+    version, code_obj2 = _load_module(pyc_filename2)
+    cmp_code_objects(version, code_obj1, code_obj2)
+
+
+__version__ = 'SPARK-0.7 (pre-alpha-7) uncompyle trim'
+
+def _namelist(instance):
+    namelist, namedict, classlist = [], {}, [instance.__class__]
+    for c in classlist:
+        for b in c.__bases__:
+            classlist.append(b)
+
+        for name in c.__dict__.keys():
+            if not namedict.has_key(name):
+                namelist.append(name)
+                namedict[name] = 1
+
+    return namelist
+
+
+class _State():
+
+    def __init__(self, stateno, items):
+        self.T, self.complete, self.items = [], [], items
+        self.stateno = stateno
+
+
+class GenericParser():
+
+    def __init__(self, start):
+        self.rules = {}
+        self.rule2func = {}
+        self.rule2name = {}
+        self.collectRules()
+        self.augment(start)
+        self.ruleschanged = 1
+
+    _NULLABLE = '\\e_'
+    _START = 'START'
+    _BOF = '|-'
+
+    def __getstate__(self):
+        if self.ruleschanged:
+            self.computeNull()
+            self.newrules = {}
+            self.new2old = {}
+            self.makeNewRules()
+            self.ruleschanged = 0
+            self.edges, self.cores = {}, {}
+            self.states = {0: self.makeState0()}
+            self.makeState(0, self._BOF)
+        changes = 1
+        while changes:
+            changes = 0
+            for k, v in self.edges.items():
+                if v is None:
+                    state, sym = k
+                    if self.states.has_key(state):
+                        self.goto(state, sym)
+                        changes = 1
+
+        rv = self.__dict__.copy()
+        for s in self.states.values():
+            del s.items
+
+        del rv['rule2func']
+        del rv['nullable']
+        del rv['cores']
+        return rv
+
+    def __setstate__(self, D):
+        self.rules = {}
+        self.rule2func = {}
+        self.rule2name = {}
+        self.collectRules()
+        start = D['rules'][self._START][0][1][1]
+        self.augment(start)
+        D['rule2func'] = self.rule2func
+        D['makeSet'] = self.makeSet_fast
+        self.__dict__ = D
+
+    def preprocess(self, rule, func):
+        return (rule, func)
+
+    def addRule(self, doc, func, _preprocess = 1):
+        fn = func
+        rules = doc.split()
+        index = []
+        for i in xrange(len(rules)):
+            if rules[i] == '::=':
+                index.append(i - 1)
+
+        index.append(len(rules))
+        for i in xrange(len(index) - 1):
+            lhs = rules[index[i]]
+            rhs = rules[index[i] + 2:index[i + 1]]
+            rule = (lhs, tuple(rhs))
+            if _preprocess:
+                rule, fn = self.preprocess(rule, func)
+            if self.rules.has_key(lhs):
+                self.rules[lhs].append(rule)
+            else:
+                self.rules[lhs] = [rule]
+            self.rule2func[rule] = fn
+            self.rule2name[rule] = func.__name__[2:]
+
+        self.ruleschanged = 1
+
+    def collectRules(self):
+        for name in _namelist(self):
+            if name[:2] == 'p_':
+                func = getattr(self, name)
+                doc = func.__doc__
+                self.addRule(doc, func)
+
+    def augment(self, start):
+        rule = '%s ::= %s %s' % (self._START, self._BOF, start)
+        self.addRule(rule, lambda args: args[1], 0)
+
+    def computeNull(self):
+        self.nullable = {}
+        tbd = []
+        for rulelist in self.rules.values():
+            lhs = rulelist[0][0]
+            self.nullable[lhs] = 0
+            for rule in rulelist:
+                rhs = rule[1]
+                if len(rhs) == 0:
+                    self.nullable[lhs] = 1
+                    continue
+                for sym in rhs:
+                    if not self.rules.has_key(sym):
+                        break
+                else:
+                    tbd.append(rule)
+
+        changes = 1
+        while changes:
+            changes = 0
+            for lhs, rhs in tbd:
+                if self.nullable[lhs]:
+                    continue
+                for sym in rhs:
+                    if not self.nullable[sym]:
+                        break
+                else:
+                    self.nullable[lhs] = 1
+                    changes = 1
+
+    def makeState0(self):
+        s0 = _State(0, [])
+        for rule in self.newrules[self._START]:
+            s0.items.append((rule, 0))
+
+        return s0
+
+    def finalState(self, tokens):
+        if len(self.newrules[self._START]) == 2 and len(tokens) == 0:
+            return 1
+        start = self.rules[self._START][0][1][1]
+        return self.goto(1, start)
+
+    def makeNewRules(self):
+        worklist = []
+        for rulelist in self.rules.values():
+            for rule in rulelist:
+                worklist.append((rule,
+                 0,
+                 1,
+                 rule))
+
+        for rule, i, candidate, oldrule in worklist:
+            lhs, rhs = rule
+            n = len(rhs)
+            while i < n:
+                sym = rhs[i]
+                if not self.rules.has_key(sym) or not self.nullable[sym]:
+                    candidate = 0
+                    i = i + 1
+                    continue
+                newrhs = list(rhs)
+                newrhs[i] = self._NULLABLE + sym
+                newrule = (lhs, tuple(newrhs))
+                worklist.append((newrule,
+                 i + 1,
+                 candidate,
+                 oldrule))
+                candidate = 0
+                i = i + 1
+            else:
+                if candidate:
+                    lhs = self._NULLABLE + lhs
+                    rule = (lhs, rhs)
+                if self.newrules.has_key(lhs):
+                    self.newrules[lhs].append(rule)
+                else:
+                    self.newrules[lhs] = [rule]
+                self.new2old[rule] = oldrule
+
+    def typestring(self, token):
+        return None
+
+    def error(self, token):
+        print "Syntax error at or near `%s' token" % token
+        raise SystemExit
+
+    def parse(self, tokens):
+        sets = [[(1, 0), (2, 0)]]
+        self.links = {}
+        if self.ruleschanged:
+            self.computeNull()
+            self.newrules = {}
+            self.new2old = {}
+            self.makeNewRules()
+            self.ruleschanged = 0
+            self.edges, self.cores = {}, {}
+            self.states = {0: self.makeState0()}
+            self.makeState(0, self._BOF)
+        for i in xrange(len(tokens)):
+            sets.append([])
+            if sets[i] == []:
+                break
+            self.makeSet(tokens[i], sets, i)
+        else:
+            sets.append([])
+            self.makeSet(None, sets, len(tokens))
+
+        finalitem = (self.finalState(tokens), 0)
+        if finalitem not in sets[-2]:
+            if len(tokens) > 0:
+                self.error(tokens[i - 1])
+            else:
+                self.error(None)
+        return self.buildTree(self._START, finalitem, tokens, len(sets) - 2)
+
+    def isnullable(self, sym):
+        return self._NULLABLE == sym[0:len(self._NULLABLE)]
+
+    def skip(self, (lhs, rhs), pos = 0):
+        n = len(rhs)
+        while pos < n:
+            if not self.isnullable(rhs[pos]):
+                break
+            pos = pos + 1
+
+        return pos
+
+    def makeState(self, state, sym):
+        assert sym is not None
+        kitems = []
+        for rule, pos in self.states[state].items:
+            lhs, rhs = rule
+            if rhs[pos:pos + 1] == (sym,):
+                kitems.append((rule, self.skip(rule, pos + 1)))
+
+        tcore = tuple(sorted(kitems))
+        if self.cores.has_key(tcore):
+            return self.cores[tcore]
+        k = self.cores[tcore] = len(self.states)
+        K, NK = _State(k, kitems), _State(k + 1, [])
+        self.states[k] = K
+        predicted = {}
+        edges = self.edges
+        rules = self.newrules
+        for X in (K, NK):
+            worklist = X.items
+            for item in worklist:
+                rule, pos = item
+                lhs, rhs = rule
+                if pos == len(rhs):
+                    X.complete.append(rule)
+                    continue
+                nextSym = rhs[pos]
+                key = (X.stateno, nextSym)
+                if not rules.has_key(nextSym):
+                    if not edges.has_key(key):
+                        edges[key] = None
+                        X.T.append(nextSym)
+                else:
+                    edges[key] = None
+                    if not predicted.has_key(nextSym):
+                        predicted[nextSym] = 1
+                        for prule in rules[nextSym]:
+                            ppos = self.skip(prule)
+                            new = (prule, ppos)
+                            NK.items.append(new)
+
+            if X is K:
+                edges = {}
+
+        if NK.items == []:
+            return k
+        tcore = tuple(sorted(predicted.keys()))
+        if self.cores.has_key(tcore):
+            self.edges[k, None] = self.cores[tcore]
+            return k
+        nk = self.cores[tcore] = self.edges[k, None] = NK.stateno
+        self.edges.update(edges)
+        self.states[nk] = NK
+        return k
+
+    def goto(self, state, sym):
+        key = (state, sym)
+        if not self.edges.has_key(key):
+            return
+        rv = self.edges[key]
+        if rv is None:
+            rv = self.makeState(state, sym)
+            self.edges[key] = rv
+        return rv
+
+    def gotoT(self, state, t):
+        return [self.goto(state, t)]
+
+    def gotoST(self, state, st):
+        rv = []
+        for t in self.states[state].T:
+            if st == t:
+                rv.append(self.goto(state, t))
+
+        return rv
+
+    def add(self, set, item, i = None, predecessor = None, causal = None):
+        if predecessor is None:
+            if item not in set:
+                set.append(item)
+        else:
+            key = (item, i)
+            if item not in set:
+                self.links[key] = []
+                set.append(item)
+            self.links[key].append((predecessor, causal))
+
+    def makeSet(self, token, sets, i):
+        cur, next = sets[i], sets[i + 1]
+        ttype = token is not None and self.typestring(token) or None
+        if ttype is not None:
+            fn, arg = self.gotoT, ttype
+        else:
+            fn, arg = self.gotoST, token
+        for item in cur:
+            ptr = (item, i)
+            state, parent = item
+            add = fn(state, arg)
+            for k in add:
+                if k is not None:
+                    self.add(next, (k, parent), i + 1, ptr)
+                    nk = self.goto(k, None)
+                    if nk is not None:
+                        self.add(next, (nk, i + 1))
+
+            if parent == i:
+                continue
+            for rule in self.states[state].complete:
+                lhs, rhs = rule
+                for pitem in sets[parent]:
+                    pstate, pparent = pitem
+                    k = self.goto(pstate, lhs)
+                    if k is not None:
+                        why = (item, i, rule)
+                        pptr = (pitem, parent)
+                        self.add(cur, (k, pparent), i, pptr, why)
+                        nk = self.goto(k, None)
+                        if nk is not None:
+                            self.add(cur, (nk, i))
+
+    def makeSet_fast(self, token, sets, i):
+        cur, next = sets[i], sets[i + 1]
+        ttype = token is not None and self.typestring(token) or None
+        for item in cur:
+            ptr = (item, i)
+            state, parent = item
+            if ttype is not None:
+                k = self.edges.get((state, ttype), None)
+                if k is not None:
+                    new = (k, parent)
+                    key = (new, i + 1)
+                    if new not in next:
+                        self.links[key] = []
+                        next.append(new)
+                    self.links[key].append((ptr, None))
+                    nk = self.edges.get((k, None), None)
+                    if nk is not None:
+                        new = (nk, i + 1)
+                        if new not in next:
+                            next.append(new)
+            else:
+                add = self.gotoST(state, token)
+                for k in add:
+                    if k is not None:
+                        self.add(next, (k, parent), i + 1, ptr)
+                        nk = self.edges.get((k, None), None)
+                        if nk is not None:
+                            self.add(next, (nk, i + 1))
+
+            if parent == i:
+                continue
+            for rule in self.states[state].complete:
+                lhs, rhs = rule
+                for pitem in sets[parent]:
+                    pstate, pparent = pitem
+                    k = self.edges.get((pstate, lhs), None)
+                    if k is not None:
+                        why = (item, i, rule)
+                        pptr = (pitem, parent)
+                        new = (k, pparent)
+                        key = (new, i)
+                        if new not in cur:
+                            self.links[key] = []
+                            cur.append(new)
+                        self.links[key].append((pptr, why))
+                        nk = self.edges.get((k, None), None)
+                        if nk is not None:
+                            new = (nk, i)
+                            if new not in cur:
+                                cur.append(new)
+
+    def predecessor(self, key, causal):
+        for p, c in self.links[key]:
+            if c == causal:
+                return p
+
+        assert 0
+
+    def causal(self, key):
+        links = self.links[key]
+        if len(links) == 1:
+            return links[0][1]
+        choices = []
+        rule2cause = {}
+        for p, c in links:
+            rule = c[2]
+            choices.append(rule)
+            rule2cause[rule] = c
+
+        return rule2cause[self.ambiguity(choices)]
+
+    def deriveEpsilon(self, nt):
+        if len(self.newrules[nt]) > 1:
+            rule = self.ambiguity(self.newrules[nt])
+        else:
+            rule = self.newrules[nt][0]
+        rhs = rule[1]
+        attr = [None] * len(rhs)
+        for i in xrange(len(rhs) - 1, -1, -1):
+            attr[i] = self.deriveEpsilon(rhs[i])
+
+        return self.rule2func[self.new2old[rule]](attr)
+
+    def buildTree(self, nt, item, tokens, k):
+        state, parent = item
+        choices = []
+        for rule in self.states[state].complete:
+            if rule[0] == nt:
+                choices.append(rule)
+
+        rule = choices[0]
+        if len(choices) > 1:
+            rule = self.ambiguity(choices)
+        rhs = rule[1]
+        attr = [None] * len(rhs)
+        for i in xrange(len(rhs) - 1, -1, -1):
+            sym = rhs[i]
+            if not self.newrules.has_key(sym):
+                if sym != self._BOF:
+                    attr[i] = tokens[k - 1]
+                    key = (item, k)
+                    item, k = self.predecessor(key, None)
+            elif self._NULLABLE == sym[0:len(self._NULLABLE)]:
+                attr[i] = self.deriveEpsilon(sym)
+            else:
+                key = (item, k)
+                why = self.causal(key)
+                attr[i] = self.buildTree(sym, why[0], tokens, why[1])
+                item, k = self.predecessor(key, why)
+
+        return self.rule2func[self.new2old[rule]](attr)
+
+    def ambiguity(self, rules):
+        sortlist = []
+        name2index = {}
+        for i in xrange(len(rules)):
+            lhs, rhs = rule = rules[i]
+            name = self.rule2name[self.new2old[rule]]
+            sortlist.append((len(rhs), name))
+            name2index[name] = i
+
+        sortlist.sort()
+        list = map(lambda (a, b): b, sortlist)
+        return rules[name2index[self.resolve(list)]]
+
+    def resolve(self, list):
+        return list[0]
+
+
+class GenericASTBuilder(GenericParser):
+
+    def __init__(self, AST, start):
+        GenericParser.__init__(self, start)
+        self.AST = AST
+
+    def preprocess(self, rule, func):
+        rebind = lambda lhs, self = self: lambda args, lhs = lhs, self = self: self.buildASTNode(args, lhs)
+        lhs, rhs = rule
+        return (rule, rebind(lhs))
+
+    def buildASTNode(self, args, lhs):
+        children = []
+        for arg in args:
+            if isinstance(arg, self.AST):
+                children.append(arg)
+            else:
+                children.append(arg)
+
+        return self.nonterminal(lhs, children)
+
+    def nonterminal(self, type, args):
+        rv = self.AST(type)
+        rv[:len(args)] = args
+        return rv
+
+
+class GenericASTTraversalPruningException():
+    pass
+
+
+HAVE_ARGUMENT = dis.HAVE_ARGUMENT
+globals().update({k.replace('+', '_'):v for k, v in dis.opmap.items()})
+PJIF = POP_JUMP_IF_FALSE
+PJIT = POP_JUMP_IF_TRUE
+JA = JUMP_ABSOLUTE
+JF = JUMP_FORWARD
+
+class Code():
+    """
+    Class for representing code-objects.
+    
+    This is similar to the original code object, but additionally
+    the diassembled code is stored in the attribute '_tokens'.
+    """
+
+    def __init__(self, co, scanner, classname = None):
+        for i in dir(co):
+            if i.startswith('co_'):
+                setattr(self, i, getattr(co, i))
+
+        self._tokens, self._customize = scanner.disassemble(co, classname)
+
+
+class Scanner():
+
+    def __init__(self, version):
+        self.version = version
+        from sys import version_info
+        self.pyversion = float('%d.%d' % version_info[0:2])
+        self.resetTokenClass()
+        self.JUMP_OPs = map(lambda op: dis.opname[op], dis.hasjrel + dis.hasjabs)
+
+    def setShowAsm(self, showasm, out = None):
+        self.showasm = showasm
+        self.out = out
+
+    def setTokenClass(self, tokenClass):
+        assert type(tokenClass) == types.ClassType
+        self.Token = tokenClass
+
+    def resetTokenClass(self):
+        self.setTokenClass(Token)
+
+    def deobfuscate(self, co, linestarts, varnames):
+        n = 0
+        code = self.code
+        for i in self.op_range(0, len(code)):
+            if code[i] in (RETURN_VALUE, END_FINALLY):
+                n = i + 1
+
+        fixed_code = array('B')
+        linestartoffsets = {a:b for a, b in linestarts[1:]}
+        newlinestarts = linestarts[0:1]
+        old_to_new = {}
+        new_to_old = {}
+        m = 0
+        for i in self.op_range(0, n):
+            old_to_new[i] = m
+            new_to_old[m] = i
+            if i in linestartoffsets:
+                newlinestarts.append((m, linestartoffsets[i]))
+            if code[i] != NOP:
+                fixed_code.append(code[i])
+                m += 1
+                if code[i] >= HAVE_ARGUMENT:
+                    fixed_code.append(code[i + 1])
+                    fixed_code.append(code[i + 2])
+                    m += 2
+
+        self.code = code = fixed_code
+        for i in self.op_range(0, m):
+            if code[i] in dis.hasjrel:
+                old_jump = code[i + 1] + code[i + 2] * 256
+                old_target = new_to_old[i] + 3 + old_jump
+                new_target = old_to_new[old_target]
+                new_jump = new_target - i - 3
+                code[i + 1] = new_jump % 256
+                code[i + 2] = new_jump // 256
+            if code[i] in dis.hasjabs:
+                old_target = code[i + 1] + code[i + 2] * 256
+                new_target = old_to_new[old_target]
+                code[i + 1] = new_target % 256
+                code[i + 2] = new_target // 256
+
+        for i in range(len(varnames)):
+            varnames[i] = 'varnames_%s' % i
+
+        for i in self.op_range(0, m):
+            if code[i] == IMPORT_NAME and code[i + 3] == STORE_FAST:
+                varname_index = code[i + 4] + code[i + 5] * 256
+                name_index = code[i + 1] + code[i + 2] * 256
+                varnames[varname_index] = co.co_names[name_index]
+
+        return newlinestarts
+
+    def disassemble(self, co, classname = None, deob = 0):
+        """
+        Disassemble a code object, returning a list of 'Token'.
+        
+        The main part of this procedure is modelled after
+        dis.disassemble().
+        """
+        rv = []
+        customize = {}
+        Token = self.Token
+        self.code = array('B', co.co_code)
+        linestarts = list(dis.findlinestarts(co))
+        varnames = list(co.co_varnames)
+        if deob:
+            linestarts = self.deobfuscate(co, linestarts, varnames)
+        code = self.code
+        n = len(code)
+        self.prev = [0]
+        for i in self.op_range(0, n):
+            op = code[i]
+            self.prev.append(i)
+            if op >= HAVE_ARGUMENT:
+                self.prev.append(i)
+                self.prev.append(i)
+
+        self.lines = []
+        linetuple = namedtuple('linetuple', ['l_no', 'next'])
+        j = 0
+        linestartoffsets = {a for a, _ in linestarts}
+        prev_start_byte, prev_line_no = linestarts[0]
+        for start_byte, line_no in linestarts[1:]:
+            while j < start_byte:
+                self.lines.append(linetuple(prev_line_no, start_byte))
+                j += 1
+
+            last_op = code[self.prev[start_byte]]
+            prev_start_byte, prev_line_no = start_byte, line_no
+
+        while j < n:
+            self.lines.append(linetuple(prev_line_no, n))
+            j += 1
+
+        if classname:
+            classname = '_' + classname.lstrip('_') + '__'
+
+            def unmangle(name):
+                if name.startswith(classname) and name[-2:] != '__':
+                    return name[len(classname) - 2:]
+                return name
+
+            free = [ unmangle(name) for name in co.co_cellvars + co.co_freevars ]
+            names = [ unmangle(name) for name in co.co_names ]
+            varnames = [ unmangle(name) for name in varnames ]
+        else:
+            free = co.co_cellvars + co.co_freevars
+            names = co.co_names
+        self.load_asserts = set()
+        for i in self.op_range(0, n):
+            if code[i] == PJIT and code[i + 3] == LOAD_GLOBAL:
+                if names[code[i + 4] + 256 * code[i + 5]] == 'AssertionError':
+                    self.load_asserts.add(i + 3)
+
+        cf = self.find_jump_targets(code)
+        last_stmt = self.next_stmt[0]
+        i = self.next_stmt[last_stmt]
+        replace = {}
+        while i < n - 1:
+            if self.lines[last_stmt].next > i:
+                if code[last_stmt] == PRINT_ITEM:
+                    if code[i] == PRINT_ITEM:
+                        replace[i] = 'PRINT_ITEM_CONT'
+                    elif code[i] == PRINT_NEWLINE:
+                        replace[i] = 'PRINT_NEWLINE_CONT'
+            last_stmt = i
+            i = self.next_stmt[i]
+
+        imports = self.all_instr(0, n, (IMPORT_NAME, IMPORT_FROM, IMPORT_STAR))
+        if len(imports) > 1:
+            last_import = imports[0]
+            for i in imports[1:]:
+                if self.lines[last_import].next > i:
+                    if code[last_import] == IMPORT_NAME == code[i]:
+                        replace[i] = 'IMPORT_NAME_CONT'
+                last_import = i
+
+        extended_arg = 0
+        for offset in self.op_range(0, n):
+            if offset in cf:
+                k = 0
+                for j in cf[offset]:
+                    rv.append(Token('COME_FROM', None, repr(j), offset='%s_%d' % (offset, k)))
+                    k += 1
+
+            op = code[offset]
+            opname = dis.opname[op]
+            oparg = None
+            pattr = None
+            if op >= HAVE_ARGUMENT:
+                oparg = code[offset + 1] + code[offset + 2] * 256 + extended_arg
+                extended_arg = 0
+                if op == dis.EXTENDED_ARG:
+                    extended_arg = oparg * 65536L
+                    continue
+                if op in dis.hasconst:
+                    const = co.co_consts[oparg]
+                    if type(const) == types.CodeType:
+                        oparg = const
+                        if const.co_name == '<lambda>':
+                            assert opname == 'LOAD_CONST'
+                            opname = 'LOAD_LAMBDA'
+                        elif const.co_name == '<genexpr>':
+                            opname = 'LOAD_GENEXPR'
+                        elif const.co_name == '<dictcomp>':
+                            opname = 'LOAD_DICTCOMP'
+                        elif const.co_name == '<setcomp>':
+                            opname = 'LOAD_SETCOMP'
+                        pattr = '<code_object ' + const.co_name + '>'
+                    else:
+                        pattr = const
+                elif op in dis.hasname:
+                    pattr = names[oparg]
+                elif op in dis.hasjrel:
+                    pattr = repr(offset + 3 + oparg)
+                elif op in dis.hasjabs:
+                    pattr = repr(oparg)
+                elif op in dis.haslocal:
+                    pattr = varnames[oparg]
+                elif op in dis.hascompare:
+                    pattr = dis.cmp_op[oparg]
+                elif op in dis.hasfree:
+                    pattr = free[oparg]
+            if op in (BUILD_LIST,
+             BUILD_TUPLE,
+             BUILD_SET,
+             BUILD_SLICE,
+             UNPACK_SEQUENCE,
+             MAKE_FUNCTION,
+             CALL_FUNCTION,
+             MAKE_CLOSURE,
+             CALL_FUNCTION_VAR,
+             CALL_FUNCTION_KW,
+             CALL_FUNCTION_VAR_KW,
+             DUP_TOPX,
+             RAISE_VARARGS):
+                if op == BUILD_TUPLE and code[self.prev[offset]] == LOAD_CLOSURE:
+                    continue
+                else:
+                    opname = '%s_%d' % (opname, oparg)
+                    if op != BUILD_SLICE:
+                        customize[opname] = oparg
+            elif op == JA:
+                target = self.get_target(offset)
+                if target < offset:
+                    if offset in self.stmts and code[offset + 3] not in (END_FINALLY, POP_BLOCK) and offset not in self.not_continue:
+                        opname = 'CONTINUE'
+                    else:
+                        opname = 'JUMP_BACK'
+            elif op == LOAD_GLOBAL:
+                if offset in self.load_asserts:
+                    opname = 'LOAD_ASSERT'
+            elif op == RETURN_VALUE:
+                if offset in self.return_end_ifs:
+                    opname = 'RETURN_END_IF'
+            if offset not in replace:
+                rv.append(Token(opname, oparg, pattr, offset, linestart=offset in linestartoffsets))
+            else:
+                rv.append(Token(replace[offset], oparg, pattr, offset, linestart=offset in linestartoffsets))
+
+        if self.showasm:
+            out = self.out
+            for t in rv:
+                print >> out, t
+
+            print >> out
+        return (rv, customize)
+
+    def get_target(self, pos, op = None):
+        if op is None:
+            op = self.code[pos]
+        target = self.code[pos + 1] + self.code[pos + 2] * 256
+        if op in dis.hasjrel:
+            target += pos + 3
+        return target
+
+    def first_instr(self, start, end, instr, target = None, exact = True):
+        """
+        Find the first <instr> in the block from start to end.
+        <instr> is any python bytecode instruction or a list of opcodes
+        If <instr> is an opcode with a target (like a jump), a target
+        destination can be specified which must match precisely if exact
+        is True, or if exact is False, the instruction which has a target
+        closest to <target> will be returned.
+        
+        Return index to it or None if not found.
+        """
+        code = self.code
+        assert start >= 0 and end <= len(code)
+        try:
+            None in instr
+        except:
+            instr = [instr]
+
+        pos = None
+        distance = len(code)
+        for i in self.op_range(start, end):
+            op = code[i]
+            if op in instr:
+                if target is None:
+                    return i
+                dest = self.get_target(i, op)
+                if dest == target:
+                    return i
+                if not exact:
+                    _distance = abs(target - dest)
+                    if _distance < distance:
+                        distance = _distance
+                        pos = i
+
+        return pos
+
+    def last_instr(self, start, end, instr, target = None, exact = True):
+        """
+        Find the last <instr> in the block from start to end.
+        <instr> is any python bytecode instruction or a list of opcodes
+        If <instr> is an opcode with a target (like a jump), a target
+        destination can be specified which must match precisely if exact
+        is True, or if exact is False, the instruction which has a target
+        closest to <target> will be returned.
+        
+        Return index to it or None if not found.
+        """
+        code = self.code
+        if not (start >= 0 and end <= len(code)):
+            return
+        try:
+            None in instr
+        except:
+            instr = [instr]
+
+        pos = None
+        distance = len(code)
+        for i in self.op_range(start, end):
+            op = code[i]
+            if op in instr:
+                if target is None:
+                    pos = i
+                else:
+                    dest = self.get_target(i, op)
+                    if dest == target:
+                        distance = 0
+                        pos = i
+                    elif not exact:
+                        _distance = abs(target - dest)
+                        if _distance <= distance:
+                            distance = _distance
+                            pos = i
+
+        return pos
+
+    def all_instr(self, start, end, instr, target = None, include_beyond_target = False):
+        """
+        Find all <instr> in the block from start to end.
+        <instr> is any python bytecode instruction or a list of opcodes
+        If <instr> is an opcode with a target (like a jump), a target
+        destination can be specified which must match precisely.
+        
+        Return a list with indexes to them or [] if none found.
+        """
+        code = self.code
+        assert start >= 0 and end <= len(code)
+        try:
+            None in instr
+        except:
+            instr = [instr]
+
+        result = []
+        for i in self.op_range(start, end):
+            op = code[i]
+            if op in instr:
+                if target is None:
+                    result.append(i)
+                else:
+                    t = self.get_target(i, op)
+                    if include_beyond_target and t >= target:
+                        result.append(i)
+                    elif t == target:
+                        result.append(i)
+
+        return result
+
+    def op_size(self, op):
+        if op < HAVE_ARGUMENT:
+            return 1
+        else:
+            return 3
+
+    def op_range(self, start, end):
+        while start < end:
+            yield start
+            start += self.op_size(self.code[start])
+
+    def build_stmt_indices(self):
+        code = self.code
+        start = 0
+        end = len(code)
+        stmt_opcodes = {SETUP_LOOP,
+         BREAK_LOOP,
+         CONTINUE_LOOP,
+         SETUP_FINALLY,
+         END_FINALLY,
+         SETUP_EXCEPT,
+         SETUP_WITH,
+         POP_BLOCK,
+         STORE_FAST,
+         DELETE_FAST,
+         STORE_DEREF,
+         STORE_GLOBAL,
+         DELETE_GLOBAL,
+         STORE_NAME,
+         DELETE_NAME,
+         STORE_ATTR,
+         DELETE_ATTR,
+         STORE_SUBSCR,
+         DELETE_SUBSCR,
+         RETURN_VALUE,
+         RAISE_VARARGS,
+         POP_TOP,
+         PRINT_EXPR,
+         PRINT_ITEM,
+         PRINT_NEWLINE,
+         PRINT_ITEM_TO,
+         PRINT_NEWLINE_TO,
+         STORE_SLICE_0,
+         STORE_SLICE_1,
+         STORE_SLICE_2,
+         STORE_SLICE_3,
+         DELETE_SLICE_0,
+         DELETE_SLICE_1,
+         DELETE_SLICE_2,
+         DELETE_SLICE_3,
+         JUMP_ABSOLUTE,
+         EXEC_STMT}
+        stmt_opcode_seqs = [(PJIF, JF),
+         (PJIF, JA),
+         (PJIT, JF),
+         (PJIT, JA)]
+        designator_ops = {STORE_FAST,
+         STORE_NAME,
+         STORE_GLOBAL,
+         STORE_DEREF,
+         STORE_ATTR,
+         STORE_SLICE_0,
+         STORE_SLICE_1,
+         STORE_SLICE_2,
+         STORE_SLICE_3,
+         STORE_SUBSCR,
+         UNPACK_SEQUENCE,
+         JA}
+        prelim = self.all_instr(start, end, stmt_opcodes)
+        stmts = self.stmts = set(prelim)
+        pass_stmts = set()
+        for seq in stmt_opcode_seqs:
+            for i in self.op_range(start, end - (len(seq) + 1)):
+                match = True
+                for elem in seq:
+                    if elem != code[i]:
+                        match = False
+                        break
+                    i += self.op_size(code[i])
+
+                if match:
+                    i = self.prev[i]
+                    stmts.add(i)
+                    pass_stmts.add(i)
+
+        if pass_stmts:
+            stmt_list = list(stmts)
+            stmt_list.sort()
+        else:
+            stmt_list = prelim
+        last_stmt = -1
+        self.next_stmt = []
+        slist = self.next_stmt = []
+        i = 0
+        for s in stmt_list:
+            if code[s] == JA and s not in pass_stmts:
+                target = self.get_target(s)
+                if target > s or self.lines[last_stmt].l_no == self.lines[s].l_no:
+                    stmts.remove(s)
+                    continue
+                j = self.prev[s]
+                while code[j] == JA:
+                    j = self.prev[j]
+
+                if code[j] == LIST_APPEND:
+                    stmts.remove(s)
+                    continue
+            elif code[s] == POP_TOP and code[self.prev[s]] == ROT_TWO:
+                stmts.remove(s)
+                continue
+            elif code[s] in designator_ops:
+                j = self.prev[s]
+                while code[j] in designator_ops:
+                    j = self.prev[j]
+
+                if code[j] == FOR_ITER:
+                    stmts.remove(s)
+                    continue
+            last_stmt = s
+            slist += [s] * (s - i)
+            i = s
+
+        slist += [len(code)] * (len(code) - len(slist))
+
+    def remove_mid_line_ifs(self, ifs):
+        filtered = []
+        for i in ifs:
+            if self.lines[i].l_no == self.lines[i + 3].l_no:
+                if self.code[self.prev[self.lines[i].next]] in (PJIT, PJIF):
+                    continue
+            filtered.append(i)
+
+        return filtered
+
+    def rem_or(self, start, end, instr, target = None, include_beyond_target = False):
+        """
+        Find all <instr> in the block from start to end.
+        <instr> is any python bytecode instruction or a list of opcodes
+        If <instr> is an opcode with a target (like a jump), a target
+        destination can be specified which must match precisely.
+        
+        Return a list with indexes to them or [] if none found.
+        """
+        code = self.code
+        assert start >= 0 and end <= len(code)
+        try:
+            None in instr
+        except:
+            instr = [instr]
+
+        result = []
+        for i in self.op_range(start, end):
+            op = code[i]
+            if op in instr:
+                if target is None:
+                    result.append(i)
+                else:
+                    t = self.get_target(i, op)
+                    if include_beyond_target and t >= target:
+                        result.append(i)
+                    elif t == target:
+                        result.append(i)
+
+        pjits = self.all_instr(start, end, PJIT)
+        filtered = []
+        for pjit in pjits:
+            tgt = self.get_target(pjit) - 3
+            for i in result:
+                if i <= pjit or i >= tgt:
+                    filtered.append(i)
+
+            result = filtered
+            filtered = []
+
+        return result
+
+    def next_except_jump(self, start):
+        """
+        Return the next jump that was generated by an except SomeException:
+        construct in a try...except...else clause or None if not found.
+        """
+        if self.code[start] == DUP_TOP:
+            except_match = self.first_instr(start, len(self.code), POP_JUMP_IF_FALSE)
+            if except_match:
+                jmp = self.prev[self.get_target(except_match)]
+                self.ignore_if.add(except_match)
+                self.not_continue.add(jmp)
+                return jmp
+        count_END_FINALLY = 0
+        count_SETUP_ = 0
+        for i in self.op_range(start, len(self.code)):
+            op = self.code[i]
+            if op == END_FINALLY:
+                if count_END_FINALLY == count_SETUP_:
+                    assert self.code[self.prev[i]] in (JA, JF, RETURN_VALUE)
+                    self.not_continue.add(self.prev[i])
+                    return self.prev[i]
+                count_END_FINALLY += 1
+            elif op in (SETUP_EXCEPT, SETUP_WITH, SETUP_FINALLY):
+                count_SETUP_ += 1
+
+    def restrict_to_parent(self, target, parent):
+        """Restrict pos to parent boundaries."""
+        if not parent['start'] < target < parent['end']:
+            target = parent['end']
+        return target
+
+    def detect_structure(self, pos, op = None):
+        """
+        Detect structures and their boundaries to fix optimizied jumps
+        in python2.3+
+        """
+        code = self.code
+        if op is None:
+            op = code[pos]
+        parent = self.structs[0]
+        start = parent['start']
+        end = parent['end']
+        for s in self.structs:
+            _start = s['start']
+            _end = s['end']
+            if _start <= pos < _end and _start >= start and _end <= end:
+                start = _start
+                end = _end
+                parent = s
+
+        origStructCount = len(self.structs)
+        if op == SETUP_LOOP:
+            start = pos + 3
+            target = self.get_target(pos, op)
+            end = self.restrict_to_parent(target, parent)
+            if target != end:
+                self.fixed_jumps[pos] = end
+            line_no, next_line_byte = self.lines[pos]
+            jump_back = self.last_instr(start, end, JA, next_line_byte, False)
+            if jump_back and jump_back != self.prev[end] and code[jump_back + 3] in (JA, JF):
+                if code[self.prev[end]] == RETURN_VALUE or code[self.prev[end]] == POP_BLOCK and code[self.prev[self.prev[end]]] == RETURN_VALUE:
+                    jump_back = None
+            if not jump_back:
+                jump_back = self.last_instr(start, end, RETURN_VALUE) + 1
+                if not jump_back:
+                    return
+                if code[self.prev[next_line_byte]] not in (PJIF, PJIT):
+                    loop_type = 'for'
+                else:
+                    loop_type = 'while'
+                    self.ignore_if.add(self.prev[next_line_byte])
+                target = next_line_byte
+                end = jump_back + 3
+            else:
+                if self.get_target(jump_back) >= next_line_byte:
+                    jump_back = self.last_instr(start, end, JA, start, False)
+                if end > jump_back + 4 and code[end] in (JF, JA):
+                    if code[jump_back + 4] in (JA, JF):
+                        if self.get_target(jump_back + 4) == self.get_target(end):
+                            self.fixed_jumps[pos] = jump_back + 4
+                            end = jump_back + 4
+                elif target < pos:
+                    self.fixed_jumps[pos] = jump_back + 4
+                    end = jump_back + 4
+                target = self.get_target(jump_back, JA)
+                if code[target] in (FOR_ITER, GET_ITER):
+                    loop_type = 'for'
+                else:
+                    loop_type = 'while'
+                    test = self.prev[next_line_byte]
+                    if test == pos:
+                        loop_type = 'while 1'
+                    else:
+                        self.ignore_if.add(test)
+                        test_target = self.get_target(test)
+                        if test_target > jump_back + 3:
+                            jump_back = test_target
+                self.not_continue.add(jump_back)
+            self.loops.append(target)
+            self.structs.append({'type': loop_type + '-loop',
+             'start': target,
+             'end': jump_back})
+            if jump_back + 3 != end:
+                self.structs.append({'type': loop_type + '-else',
+                 'start': jump_back + 3,
+                 'end': end})
+        elif op == SETUP_EXCEPT:
+            start = pos + 3
+            target = self.get_target(pos, op)
+            end = self.restrict_to_parent(target, parent)
+            if target != end:
+                self.fixed_jumps[pos] = end
+            self.structs.append({'type': 'try',
+             'start': start,
+             'end': end - 4})
+            end_else = start_else = self.get_target(self.prev[end])
+            i = end
+            while self.code[i] != END_FINALLY:
+                jmp = self.next_except_jump(i)
+                if self.code[jmp] == RETURN_VALUE:
+                    self.structs.append({'type': 'except',
+                     'start': i,
+                     'end': jmp + 1})
+                    i = jmp + 1
+                else:
+                    if self.get_target(jmp) != start_else:
+                        end_else = self.get_target(jmp)
+                    if self.code[jmp] == JF:
+                        self.fixed_jumps[jmp] = -1
+                    self.structs.append({'type': 'except',
+                     'start': i,
+                     'end': jmp})
+                    i = jmp + 3
+
+            if end_else != start_else:
+                r_end_else = self.restrict_to_parent(end_else, parent)
+                self.structs.append({'type': 'try-else',
+                 'start': i + 1,
+                 'end': r_end_else})
+                self.fixed_jumps[i] = r_end_else
+            else:
+                self.fixed_jumps[i] = i + 1
+        elif op in (PJIF, PJIT):
+            start = pos + 3
+            target = self.get_target(pos, op)
+            rtarget = self.restrict_to_parent(target, parent)
+            pre = self.prev
+            if target != rtarget and parent['type'] == 'and/or':
+                self.fixed_jumps[pos] = rtarget
+                return
+            if code[pre[target]] in (JUMP_IF_FALSE_OR_POP,
+             JUMP_IF_TRUE_OR_POP,
+             PJIF,
+             PJIT) and target > pos:
+                self.fixed_jumps[pos] = pre[target]
+                self.structs.append({'type': 'and/or',
+                 'start': start,
+                 'end': pre[target]})
+                return
+            if op == PJIF:
+                match = self.rem_or(start, self.next_stmt[pos], PJIF, target)
+                match = self.remove_mid_line_ifs(match)
+                if match:
+                    if code[pre[rtarget]] in (JF, JA) and pre[rtarget] not in self.stmts and self.restrict_to_parent(self.get_target(pre[rtarget]), parent) == rtarget:
+                        if code[pre[pre[rtarget]]] == JA and self.remove_mid_line_ifs([pos]) and target == self.get_target(pre[pre[rtarget]]) and (pre[pre[rtarget]] not in self.stmts or self.get_target(pre[pre[rtarget]]) > pre[pre[rtarget]]) and 1 == len(self.remove_mid_line_ifs(self.rem_or(start, pre[pre[rtarget]], (PJIF, PJIT), target))):
+                            pass
+                        elif code[pre[pre[rtarget]]] == RETURN_VALUE and self.remove_mid_line_ifs([pos]) and 1 == len(set(self.remove_mid_line_ifs(self.rem_or(start, pre[pre[rtarget]], (PJIF, PJIT), target))) | set(self.remove_mid_line_ifs(self.rem_or(start, pre[pre[rtarget]], (PJIF, PJIT, JA), pre[rtarget], True)))):
+                            pass
+                        else:
+                            fix = None
+                            jump_ifs = self.all_instr(start, self.next_stmt[pos], PJIF)
+                            last_jump_good = True
+                            for j in jump_ifs:
+                                if target == self.get_target(j):
+                                    if self.lines[j].next == j + 3 and last_jump_good:
+                                        fix = j
+                                        break
+                                else:
+                                    last_jump_good = False
+
+                            self.fixed_jumps[pos] = fix or match[-1]
+                            return
+                    else:
+                        self.fixed_jumps[pos] = match[-1]
+                        return
+            else:
+                if pos + 3 in self.load_asserts:
+                    if code[pre[rtarget]] == RAISE_VARARGS:
+                        return
+                    self.load_asserts.remove(pos + 3)
+                next = self.next_stmt[pos]
+                if pre[next] == pos:
+                    pass
+                elif code[next] in (JF, JA) and target == self.get_target(next):
+                    if code[pre[next]] == PJIF:
+                        if code[next] == JF or target != rtarget or code[pre[pre[rtarget]]] not in (JA, RETURN_VALUE):
+                            self.fixed_jumps[pos] = pre[next]
+                            return
+                elif code[next] == JA and code[target] in (JA, JF):
+                    next_target = self.get_target(next)
+                    if self.get_target(target) == next_target:
+                        self.fixed_jumps[pos] = pre[next]
+                        return
+                    if code[next_target] in (JA, JF) and self.get_target(next_target) == self.get_target(target):
+                        self.fixed_jumps[pos] = pre[next]
+                        return
+            if pos in self.ignore_if:
+                return
+            if code[pre[rtarget]] == JA and pre[rtarget] in self.stmts and pre[rtarget] != pos and pre[pre[rtarget]] != pos:
+                if code[rtarget] == JA and code[rtarget + 3] == POP_BLOCK:
+                    if code[pre[pre[rtarget]]] != JA:
+                        pass
+                    elif self.get_target(pre[pre[rtarget]]) != target:
+                        pass
+                    else:
+                        rtarget = pre[rtarget]
+                else:
+                    rtarget = pre[rtarget]
+            if code[pre[rtarget]] in (JA, JF):
+                if_end = self.get_target(pre[rtarget])
+                if if_end < pre[rtarget] and code[pre[if_end]] == SETUP_LOOP:
+                    if if_end > start:
+                        return
+                end = self.restrict_to_parent(if_end, parent)
+                self.structs.append({'type': 'if-then',
+                 'start': start,
+                 'end': pre[rtarget]})
+                self.not_continue.add(pre[rtarget])
+                if rtarget < end:
+                    self.structs.append({'type': 'if-else',
+                     'start': rtarget,
+                     'end': end})
+            elif code[pre[rtarget]] == RETURN_VALUE:
+                self.structs.append({'type': 'if-then',
+                 'start': start,
+                 'end': rtarget})
+                self.return_end_ifs.add(pre[rtarget])
+        elif op in (JUMP_IF_FALSE_OR_POP, JUMP_IF_TRUE_OR_POP):
+            target = self.get_target(pos, op)
+            self.fixed_jumps[pos] = self.restrict_to_parent(target, parent)
+
+    def find_jump_targets(self, code):
+        """
+        Detect all offsets in a byte code which are jump targets.
+        
+        Return the list of offsets.
+        
+        This procedure is modelled after dis.findlables(), but here
+        for each target the number of jumps are counted.
+        """
+        hasjrel = dis.hasjrel
+        hasjabs = dis.hasjabs
+        n = len(code)
+        self.structs = [{'type': 'root',
+          'start': 0,
+          'end': n - 1}]
+        self.loops = []
+        self.fixed_jumps = {}
+        self.ignore_if = set()
+        self.build_stmt_indices()
+        self.not_continue = set()
+        self.return_end_ifs = set()
+        targets = {}
+        for i in self.op_range(0, n):
+            op = code[i]
+            self.detect_structure(i, op)
+            if op >= HAVE_ARGUMENT:
+                label = self.fixed_jumps.get(i)
+                oparg = code[i + 1] + code[i + 2] * 256
+                if label is None:
+                    if op in hasjrel and op != FOR_ITER:
+                        label = i + 3 + oparg
+                    elif op in hasjabs:
+                        if op in (JUMP_IF_FALSE_OR_POP, JUMP_IF_TRUE_OR_POP):
+                            if oparg > i:
+                                label = oparg
+                if label is not None and label != -1:
+                    targets[label] = targets.get(label, []) + [i]
+            elif op == END_FINALLY and i in self.fixed_jumps:
+                label = self.fixed_jumps[i]
+                targets[label] = targets.get(label, []) + [i]
+
+        return targets
+
+
+__scanners = {}
+
+def getscanner(version):
+    if not __scanners.has_key(version):
+        __scanners[version] = Scanner(version)
+    return __scanners[version]
+
+
+class Parser(GenericASTBuilder):
+
+    def __init__(self):
+        GenericASTBuilder.__init__(self, AST, 'stmts')
+        self.customized = {}
+
+    def cleanup(self):
+        """
+        Remove recursive references to allow garbage
+        collector to collect this object.
+        """
+        for dict in (self.rule2func, self.rules, self.rule2name):
+            for i in dict.keys():
+                dict[i] = None
+
+        for i in dir(self):
+            setattr(self, i, None)
+
+    def error(self, token):
+        raise ParserError0(token, token.offset)
+
+    def typestring(self, token):
+        return token.type
+
+    def p_funcdef(self, args):
+        """
+        stmt ::= funcdef
+        funcdef ::= mkfunc designator
+        stmt ::= funcdefdeco
+        funcdefdeco ::= mkfuncdeco designator
+        mkfuncdeco ::= expr mkfuncdeco CALL_FUNCTION_1
+        mkfuncdeco ::= expr mkfuncdeco0 CALL_FUNCTION_1
+        mkfuncdeco0 ::= mkfunc
+        load_closure ::= load_closure LOAD_CLOSURE
+        load_closure ::= LOAD_CLOSURE
+        """
+        pass
+
+    def p_list_comprehension(self, args):
+        """
+        expr ::= list_compr
+        list_compr ::= BUILD_LIST_0 list_iter
+        
+        
+        list_iter ::= list_for
+        list_iter ::= list_if
+        list_iter ::= list_if_not
+        list_iter ::= lc_body
+        
+        _come_from ::= COME_FROM
+        _come_from ::=
+        
+        
+        list_for ::= expr _for designator list_iter JUMP_BACK
+        list_if ::= expr jmp_false list_iter
+        list_if_not ::= expr jmp_true list_iter
+        
+        lc_body ::= expr LIST_APPEND
+        """
+        pass
+
+    def p_setcomp(self, args):
+        """
+        expr ::= setcomp
+        
+        setcomp ::= LOAD_SETCOMP MAKE_FUNCTION_0 expr GET_ITER CALL_FUNCTION_1
+        
+        stmt ::= setcomp_func
+        
+        setcomp_func ::= BUILD_SET_0 LOAD_FAST FOR_ITER designator comp_iter
+                JUMP_BACK RETURN_VALUE RETURN_LAST
+        
+        comp_iter ::= comp_if
+        comp_iter ::= comp_ifnot
+        comp_iter ::= comp_for
+        comp_iter ::= comp_body
+        comp_body ::= set_comp_body
+        comp_body ::= gen_comp_body
+        comp_body ::= dict_comp_body
+        set_comp_body ::= expr SET_ADD
+        gen_comp_body ::= expr YIELD_VALUE POP_TOP
+        dict_comp_body ::= expr expr MAP_ADD
+        
+        comp_if ::= expr jmp_false comp_iter
+        comp_ifnot ::= expr jmp_true comp_iter
+        comp_for ::= expr _for designator comp_iter JUMP_BACK
+        """
+        pass
+
+    def p_genexpr(self, args):
+        """
+        expr ::= genexpr
+        
+        genexpr ::= LOAD_GENEXPR MAKE_FUNCTION_0 expr GET_ITER CALL_FUNCTION_1
+        
+        stmt ::= genexpr_func
+        
+        genexpr_func ::= LOAD_FAST FOR_ITER designator comp_iter JUMP_BACK
+        """
+        pass
+
+    def p_dictcomp(self, args):
+        """
+        expr ::= dictcomp
+        dictcomp ::= LOAD_DICTCOMP MAKE_FUNCTION_0 expr GET_ITER CALL_FUNCTION_1
+        stmt ::= dictcomp_func
+        
+        dictcomp_func ::= BUILD_MAP LOAD_FAST FOR_ITER designator
+                comp_iter JUMP_BACK RETURN_VALUE RETURN_LAST
+        
+        """
+        pass
+
+    def p_augmented_assign(self, args):
+        """
+        stmt ::= augassign1
+        stmt ::= augassign2
+        augassign1 ::= expr expr inplace_op designator
+        augassign1 ::= expr expr inplace_op ROT_THREE STORE_SUBSCR
+        augassign1 ::= expr expr inplace_op ROT_TWO   STORE_SLICE+0
+        augassign1 ::= expr expr inplace_op ROT_THREE STORE_SLICE+1
+        augassign1 ::= expr expr inplace_op ROT_THREE STORE_SLICE+2
+        augassign1 ::= expr expr inplace_op ROT_FOUR  STORE_SLICE+3
+        augassign2 ::= expr DUP_TOP LOAD_ATTR expr
+                inplace_op ROT_TWO   STORE_ATTR
+        
+        inplace_op ::= INPLACE_ADD
+        inplace_op ::= INPLACE_SUBTRACT
+        inplace_op ::= INPLACE_MULTIPLY
+        inplace_op ::= INPLACE_DIVIDE
+        inplace_op ::= INPLACE_TRUE_DIVIDE
+        inplace_op ::= INPLACE_FLOOR_DIVIDE
+        inplace_op ::= INPLACE_MODULO
+        inplace_op ::= INPLACE_POWER
+        inplace_op ::= INPLACE_LSHIFT
+        inplace_op ::= INPLACE_RSHIFT
+        inplace_op ::= INPLACE_AND
+        inplace_op ::= INPLACE_XOR
+        inplace_op ::= INPLACE_OR
+        """
+        pass
+
+    def p_assign(self, args):
+        """
+        stmt ::= assign
+        assign ::= expr DUP_TOP designList
+        assign ::= expr designator
+        
+        stmt ::= assign2
+        stmt ::= assign3
+        assign2 ::= expr expr ROT_TWO designator designator
+        assign3 ::= expr expr expr ROT_THREE ROT_TWO designator designator designator
+        """
+        pass
+
+    def p_print(self, args):
+        """
+        stmt ::= print_items_stmt
+        stmt ::= print_nl
+        stmt ::= print_items_nl_stmt
+        
+        print_items_stmt ::= expr PRINT_ITEM print_items_opt
+        print_items_nl_stmt ::= expr PRINT_ITEM print_items_opt PRINT_NEWLINE_CONT
+        print_items_opt ::= print_items
+        print_items_opt ::=
+        print_items ::= print_items print_item
+        print_items ::= print_item
+        print_item ::= expr PRINT_ITEM_CONT
+        print_nl ::= PRINT_NEWLINE
+        """
+        pass
+
+    def p_print_to(self, args):
+        """
+        stmt ::= print_to
+        stmt ::= print_to_nl
+        stmt ::= print_nl_to
+        print_to ::= expr print_to_items POP_TOP
+        print_to_nl ::= expr print_to_items PRINT_NEWLINE_TO
+        print_nl_to ::= expr PRINT_NEWLINE_TO
+        print_to_items ::= print_to_items print_to_item
+        print_to_items ::= print_to_item
+        print_to_item ::= DUP_TOP expr ROT_TWO PRINT_ITEM_TO
+        """
+        pass
+
+    def p_import20(self, args):
+        """
+        stmt ::= importstmt
+        stmt ::= importfrom
+        stmt ::= importstar
+        stmt ::= importmultiple
+        
+        importlist2 ::= importlist2 import_as
+        importlist2 ::= import_as
+        import_as ::= IMPORT_NAME designator
+        import_as ::= IMPORT_NAME load_attrs designator
+        import_as ::= IMPORT_FROM designator
+        
+        importstmt ::= LOAD_CONST LOAD_CONST import_as
+        importstar ::= LOAD_CONST LOAD_CONST IMPORT_NAME IMPORT_STAR
+        importfrom ::= LOAD_CONST LOAD_CONST IMPORT_NAME importlist2 POP_TOP
+        importstar ::= LOAD_CONST LOAD_CONST IMPORT_NAME_CONT IMPORT_STAR
+        importfrom ::= LOAD_CONST LOAD_CONST IMPORT_NAME_CONT importlist2 POP_TOP
+        importmultiple ::= LOAD_CONST LOAD_CONST import_as imports_cont
+        
+        imports_cont ::= imports_cont import_cont
+        imports_cont ::= import_cont
+        import_cont ::= LOAD_CONST LOAD_CONST import_as_cont
+        import_as_cont ::= IMPORT_NAME_CONT designator
+        import_as_cont ::= IMPORT_NAME_CONT load_attrs designator
+        import_as_cont ::= IMPORT_FROM designator
+        
+        load_attrs ::= LOAD_ATTR
+        load_attrs ::= load_attrs LOAD_ATTR
+        """
+        pass
+
+    def p_grammar(self, args):
+        """
+        stmts ::= stmts sstmt
+        stmts ::= sstmt
+        sstmt ::= stmt
+        sstmt ::= ifelsestmtr
+        sstmt ::= return_stmt RETURN_LAST
+        
+        stmts_opt ::= stmts
+        stmts_opt ::= passstmt
+        passstmt ::=
+        
+        _stmts ::= _stmts stmt
+        _stmts ::= stmt
+        
+        c_stmts ::= _stmts
+        c_stmts ::= _stmts lastc_stmt
+        c_stmts ::= lastc_stmt
+        c_stmts ::= continue_stmts
+        
+        lastc_stmt ::= iflaststmt
+        lastc_stmt ::= whileelselaststmt
+        lastc_stmt ::= forelselaststmt
+        lastc_stmt ::= ifelsestmtr
+        lastc_stmt ::= ifelsestmtc
+        lastc_stmt ::= tryelsestmtc
+        
+        c_stmts_opt ::= c_stmts
+        c_stmts_opt ::= passstmt
+        
+        l_stmts ::= _stmts
+        l_stmts ::= return_stmts
+        l_stmts ::= continue_stmts
+        l_stmts ::= _stmts lastl_stmt
+        l_stmts ::= lastl_stmt
+        
+        lastl_stmt ::= iflaststmtl
+        lastl_stmt ::= ifelsestmtl
+        lastl_stmt ::= forelselaststmtl
+        lastl_stmt ::= tryelsestmtl
+        
+        l_stmts_opt ::= l_stmts
+        l_stmts_opt ::= passstmt
+        
+        suite_stmts ::= _stmts
+        suite_stmts ::= return_stmts
+        suite_stmts ::= continue_stmts
+        
+        suite_stmts_opt ::= suite_stmts
+        suite_stmts_opt ::= passstmt
+        
+        else_suite ::= suite_stmts
+        else_suitel ::= l_stmts
+        else_suitec ::= c_stmts
+        else_suitec ::= return_stmts
+        
+        designList ::= designator designator
+        designList ::= designator DUP_TOP designList
+        
+        designator ::= STORE_FAST
+        designator ::= STORE_NAME
+        designator ::= STORE_GLOBAL
+        designator ::= STORE_DEREF
+        designator ::= expr STORE_ATTR
+        designator ::= expr STORE_SLICE+0
+        designator ::= expr expr STORE_SLICE+1
+        designator ::= expr expr STORE_SLICE+2
+        designator ::= expr expr expr STORE_SLICE+3
+        designator ::= store_subscr
+        store_subscr ::= expr expr STORE_SUBSCR
+        designator ::= unpack
+        designator ::= unpack_list
+        
+        stmt ::= classdef
+        stmt ::= call_stmt
+        call_stmt ::= expr POP_TOP
+        
+        stmt ::= return_stmt
+        return_stmt ::= ret_expr RETURN_VALUE
+        return_stmts ::= return_stmt
+        return_stmts ::= _stmts return_stmt
+        
+        return_if_stmts ::= return_if_stmt
+        return_if_stmts ::= _stmts return_if_stmt
+        return_if_stmt ::= ret_expr RETURN_END_IF
+        
+        
+        stmt ::= break_stmt
+        break_stmt ::= BREAK_LOOP
+        
+        stmt ::= continue_stmt
+        continue_stmt ::= CONTINUE
+        continue_stmt ::= CONTINUE_LOOP
+        continue_stmts ::= _stmts lastl_stmt continue_stmt
+        continue_stmts ::= lastl_stmt continue_stmt
+        continue_stmts ::= continue_stmt
+        
+        stmt ::= raise_stmt0
+        stmt ::= raise_stmt1
+        stmt ::= raise_stmt2
+        stmt ::= raise_stmt3
+        
+        raise_stmt0 ::= RAISE_VARARGS_0
+        raise_stmt1 ::= expr RAISE_VARARGS_1
+        raise_stmt2 ::= expr expr RAISE_VARARGS_2
+        raise_stmt3 ::= expr expr expr RAISE_VARARGS_3
+        
+        stmt ::= exec_stmt
+        exec_stmt ::= expr exprlist DUP_TOP EXEC_STMT
+        exec_stmt ::= expr exprlist EXEC_STMT
+        
+        stmt ::= assert
+        stmt ::= assert2
+        stmt ::= ifstmt
+        stmt ::= ifelsestmt
+        
+        stmt ::= whilestmt
+        stmt ::= whilenotstmt
+        stmt ::= while1stmt
+        stmt ::= whileelsestmt
+        stmt ::= while1elsestmt
+        stmt ::= forstmt
+        stmt ::= forelsestmt
+        stmt ::= trystmt
+        stmt ::= tryelsestmt
+        stmt ::= tryfinallystmt
+        stmt ::= withstmt
+        stmt ::= withasstmt
+        
+        stmt ::= del_stmt
+        del_stmt ::= DELETE_FAST
+        del_stmt ::= DELETE_NAME
+        del_stmt ::= DELETE_GLOBAL
+        del_stmt ::= expr DELETE_SLICE+0
+        del_stmt ::= expr expr DELETE_SLICE+1
+        del_stmt ::= expr expr DELETE_SLICE+2
+        del_stmt ::= expr expr expr DELETE_SLICE+3
+        del_stmt ::= delete_subscr
+        delete_subscr ::= expr expr DELETE_SUBSCR
+        del_stmt ::= expr DELETE_ATTR
+        
+        kwarg   ::= LOAD_CONST expr
+        
+        classdef ::= LOAD_CONST expr mkfunc
+                    CALL_FUNCTION_0 BUILD_CLASS designator
+        
+        stmt ::= classdefdeco
+        classdefdeco ::= classdefdeco1 designator
+        classdefdeco1 ::= expr classdefdeco1 CALL_FUNCTION_1
+        classdefdeco1 ::= expr classdefdeco2 CALL_FUNCTION_1
+        classdefdeco2 ::= LOAD_CONST expr mkfunc CALL_FUNCTION_0 BUILD_CLASS
+        
+        assert ::= assert_expr POP_JUMP_IF_TRUE
+                LOAD_ASSERT RAISE_VARARGS_1
+        
+        assert2 ::= assert_expr POP_JUMP_IF_TRUE
+                LOAD_ASSERT expr CALL_FUNCTION_1 RAISE_VARARGS_1
+        
+        assert2 ::= assert_expr POP_JUMP_IF_TRUE
+                LOAD_ASSERT expr RAISE_VARARGS_2
+        
+        assert_expr ::= expr
+        assert_expr ::= assert_expr_or
+        assert_expr ::= assert_expr_and
+        assert_expr_or ::= assert_expr POP_JUMP_IF_TRUE expr
+        assert_expr_and ::= assert_expr POP_JUMP_IF_FALSE expr
+        
+        
+        _jump ::= JUMP_ABSOLUTE
+        _jump ::= JUMP_FORWARD
+        _jump ::= JUMP_BACK
+        
+        jmp_false    ::= POP_JUMP_IF_FALSE
+        jmp_true    ::= POP_JUMP_IF_TRUE
+        
+        ifstmt ::= testexpr _ifstmts_jump
+        
+        
+        testexpr ::= testfalse
+        testexpr ::= testtrue
+        testfalse ::= expr jmp_false
+        testtrue ::= expr jmp_true
+        
+        _ifstmts_jump ::= return_if_stmts
+        _ifstmts_jump ::= c_stmts_opt JUMP_FORWARD COME_FROM
+        
+        iflaststmt ::= testexpr c_stmts_opt JUMP_ABSOLUTE
+        
+        iflaststmtl ::= testexpr c_stmts_opt JUMP_BACK
+        
+        ifelsestmt ::= testexpr c_stmts_opt JUMP_FORWARD else_suite COME_FROM
+        
+        ifelsestmtc ::= testexpr c_stmts_opt JUMP_ABSOLUTE else_suitec
+        
+        ifelsestmtr ::= testexpr return_if_stmts return_stmts
+        
+        ifelsestmtl ::= testexpr c_stmts_opt JUMP_BACK else_suitel
+        
+        
+        trystmt ::= SETUP_EXCEPT suite_stmts_opt POP_BLOCK
+                try_middle COME_FROM
+        
+        tryelsestmt ::= SETUP_EXCEPT suite_stmts_opt POP_BLOCK
+                try_middle else_suite COME_FROM
+        
+        tryelsestmtc ::= SETUP_EXCEPT suite_stmts_opt POP_BLOCK
+                try_middle else_suitec COME_FROM
+        
+        tryelsestmtl ::= SETUP_EXCEPT suite_stmts_opt POP_BLOCK
+                try_middle else_suitel COME_FROM
+        
+        try_middle ::= jmp_abs COME_FROM except_stmts
+                END_FINALLY
+        try_middle ::= JUMP_FORWARD COME_FROM except_stmts
+                END_FINALLY COME_FROM
+        
+        except_stmts ::= except_stmts except_stmt
+        except_stmts ::= except_stmt
+        
+        except_stmt ::= except_cond1 except_suite
+        except_stmt ::= except_cond2 except_suite
+        except_stmt ::= except
+        
+        except_suite ::= c_stmts_opt JUMP_FORWARD
+        except_suite ::= c_stmts_opt jmp_abs
+        except_suite ::= return_stmts
+        
+        except_cond1 ::= DUP_TOP expr COMPARE_OP
+                POP_JUMP_IF_FALSE POP_TOP POP_TOP POP_TOP
+        
+        except_cond2 ::= DUP_TOP expr COMPARE_OP
+                POP_JUMP_IF_FALSE POP_TOP designator POP_TOP
+        
+        except  ::=  POP_TOP POP_TOP POP_TOP c_stmts_opt JUMP_FORWARD
+        except  ::=  POP_TOP POP_TOP POP_TOP c_stmts_opt jmp_abs
+        except  ::=  POP_TOP POP_TOP POP_TOP return_stmts
+        
+        jmp_abs ::= JUMP_ABSOLUTE
+        jmp_abs ::= JUMP_BACK
+        
+        
+        
+        tryfinallystmt ::= SETUP_FINALLY suite_stmts
+                POP_BLOCK LOAD_CONST
+                COME_FROM suite_stmts_opt END_FINALLY
+        
+        withstmt ::= expr SETUP_WITH POP_TOP suite_stmts_opt
+                POP_BLOCK LOAD_CONST COME_FROM
+                WITH_CLEANUP END_FINALLY
+        
+        withasstmt ::= expr SETUP_WITH designator suite_stmts_opt
+                POP_BLOCK LOAD_CONST COME_FROM
+                WITH_CLEANUP END_FINALLY
+        
+        whilestmt ::= SETUP_LOOP
+                testexpr
+                l_stmts_opt JUMP_BACK
+                POP_BLOCK COME_FROM
+        
+        whilestmt ::= SETUP_LOOP
+                testexpr
+                return_stmts
+                POP_BLOCK COME_FROM
+        
+        while1stmt ::= SETUP_LOOP l_stmts JUMP_BACK COME_FROM
+        while1stmt ::= SETUP_LOOP return_stmts COME_FROM
+        while1elsestmt ::= SETUP_LOOP l_stmts JUMP_BACK else_suite COME_FROM
+        
+        whileelsestmt ::= SETUP_LOOP testexpr
+                l_stmts_opt JUMP_BACK
+                POP_BLOCK
+                else_suite COME_FROM
+        
+        whileelselaststmt ::= SETUP_LOOP testexpr
+                l_stmts_opt JUMP_BACK
+                POP_BLOCK
+                else_suitec COME_FROM
+        
+        _for ::= GET_ITER FOR_ITER
+        _for ::= LOAD_CONST FOR_LOOP
+        
+        for_block ::= l_stmts_opt JUMP_BACK
+        for_block ::= return_stmts _come_from
+        
+        forstmt ::= SETUP_LOOP expr _for designator
+                for_block POP_BLOCK COME_FROM
+        
+        forelsestmt ::= SETUP_LOOP expr _for designator
+                for_block POP_BLOCK else_suite COME_FROM
+        
+        forelselaststmt ::= SETUP_LOOP expr _for designator
+                for_block POP_BLOCK else_suitec COME_FROM
+        
+        forelselaststmtl ::= SETUP_LOOP expr _for designator
+                for_block POP_BLOCK else_suitel COME_FROM
+        
+        """
+        pass
+
+    def p_expr(self, args):
+        """
+        expr ::= _mklambda
+        expr ::= SET_LINENO
+        expr ::= LOAD_FAST
+        expr ::= LOAD_NAME
+        expr ::= LOAD_CONST
+        expr ::= LOAD_GLOBAL
+        expr ::= LOAD_DEREF
+        expr ::= LOAD_LOCALS
+        expr ::= load_attr
+        expr ::= binary_expr
+        expr ::= binary_expr_na
+        expr ::= build_list
+        expr ::= cmp
+        expr ::= mapexpr
+        expr ::= and
+        expr ::= and2
+        expr ::= or
+        expr ::= unary_expr
+        expr ::= call_function
+        expr ::= unary_not
+        expr ::= unary_convert
+        expr ::= binary_subscr
+        expr ::= binary_subscr2
+        expr ::= load_attr
+        expr ::= get_iter
+        expr ::= slice0
+        expr ::= slice1
+        expr ::= slice2
+        expr ::= slice3
+        expr ::= buildslice2
+        expr ::= buildslice3
+        expr ::= yield
+        
+        
+        
+        binary_expr ::= expr expr binary_op
+        binary_op ::= BINARY_ADD
+        binary_op ::= BINARY_MULTIPLY
+        binary_op ::= BINARY_AND
+        binary_op ::= BINARY_OR
+        binary_op ::= BINARY_XOR
+        binary_op ::= BINARY_SUBTRACT
+        binary_op ::= BINARY_DIVIDE
+        binary_op ::= BINARY_TRUE_DIVIDE
+        binary_op ::= BINARY_FLOOR_DIVIDE
+        binary_op ::= BINARY_MODULO
+        binary_op ::= BINARY_LSHIFT
+        binary_op ::= BINARY_RSHIFT
+        binary_op ::= BINARY_POWER
+        
+        unary_expr ::= expr unary_op
+        unary_op ::= UNARY_POSITIVE
+        unary_op ::= UNARY_NEGATIVE
+        unary_op ::= UNARY_INVERT
+        
+        unary_not ::= expr UNARY_NOT
+        unary_convert ::= expr UNARY_CONVERT
+        
+        binary_subscr ::= expr expr BINARY_SUBSCR
+        binary_subscr2 ::= expr expr DUP_TOPX_2 BINARY_SUBSCR
+        
+        load_attr ::= expr LOAD_ATTR
+        get_iter ::= expr GET_ITER
+        slice0 ::= expr SLICE+0
+        slice0 ::= expr DUP_TOP SLICE+0
+        slice1 ::= expr expr SLICE+1
+        slice1 ::= expr expr DUP_TOPX_2 SLICE+1
+        slice2 ::= expr expr SLICE+2
+        slice2 ::= expr expr DUP_TOPX_2 SLICE+2
+        slice3 ::= expr expr expr SLICE+3
+        slice3 ::= expr expr expr DUP_TOPX_3 SLICE+3
+        buildslice3 ::= expr expr expr BUILD_SLICE_3
+        buildslice2 ::= expr expr BUILD_SLICE_2
+        
+        yield ::= expr YIELD_VALUE
+        
+        _mklambda ::= load_closure mklambda
+        _mklambda ::= mklambda
+        
+        or   ::= expr POP_JUMP_IF_TRUE expr COME_FROM
+        or   ::= expr JUMP_IF_TRUE_OR_POP expr COME_FROM
+        and  ::= expr POP_JUMP_IF_FALSE expr COME_FROM
+        and  ::= expr JUMP_IF_FALSE_OR_POP expr COME_FROM
+        and2 ::= _jump POP_JUMP_IF_FALSE COME_FROM expr COME_FROM
+        
+        expr ::= conditional
+        conditional ::= expr POP_JUMP_IF_FALSE expr JUMP_FORWARD expr COME_FROM
+        conditional ::= expr POP_JUMP_IF_FALSE expr JUMP_ABSOLUTE expr
+        expr ::= conditionalnot
+        conditionalnot ::= expr POP_JUMP_IF_TRUE expr JUMP_FORWARD expr COME_FROM
+        conditionalnot ::= expr POP_JUMP_IF_TRUE expr JUMP_ABSOLUTE expr
+        
+        ret_expr ::= expr
+        ret_expr ::= ret_and
+        ret_expr ::= ret_or
+        
+        ret_expr_or_cond ::= ret_expr
+        ret_expr_or_cond ::= ret_cond
+        ret_expr_or_cond ::= ret_cond_not
+        
+        ret_and  ::= expr JUMP_IF_FALSE_OR_POP ret_expr_or_cond COME_FROM
+        ret_or   ::= expr JUMP_IF_TRUE_OR_POP ret_expr_or_cond COME_FROM
+        ret_cond ::= expr POP_JUMP_IF_FALSE expr RETURN_END_IF ret_expr_or_cond
+        ret_cond_not ::= expr POP_JUMP_IF_TRUE expr RETURN_END_IF ret_expr_or_cond
+        
+        stmt ::= return_lambda
+        stmt ::= conditional_lambda
+        
+        return_lambda ::= ret_expr RETURN_VALUE LAMBDA_MARKER
+        conditional_lambda ::= expr POP_JUMP_IF_FALSE return_if_stmt return_stmt LAMBDA_MARKER
+        
+        cmp ::= cmp_list
+        cmp ::= compare
+        compare ::= expr expr COMPARE_OP
+        cmp_list ::= expr cmp_list1 ROT_TWO POP_TOP
+                _come_from
+        cmp_list1 ::= expr DUP_TOP ROT_THREE
+                COMPARE_OP JUMP_IF_FALSE_OR_POP
+                cmp_list1 COME_FROM
+        cmp_list1 ::= expr DUP_TOP ROT_THREE
+                COMPARE_OP JUMP_IF_FALSE_OR_POP
+                cmp_list2 COME_FROM
+        cmp_list2 ::= expr COMPARE_OP JUMP_FORWARD
+        cmp_list2 ::= expr COMPARE_OP RETURN_VALUE
+        mapexpr ::= BUILD_MAP kvlist
+        
+        kvlist ::= kvlist kv
+        kvlist ::= kvlist kv2
+        kvlist ::= kvlist kv3
+        kvlist ::=
+        
+        kv ::= DUP_TOP expr ROT_TWO expr STORE_SUBSCR
+        kv2 ::= DUP_TOP expr expr ROT_THREE STORE_SUBSCR
+        kv3 ::= expr expr STORE_MAP
+        
+        exprlist ::= exprlist expr
+        exprlist ::= expr
+        
+        nullexprlist ::=
+        
+        expr32 ::= expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr expr
+        expr1024 ::= expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32 expr32
+        """
+        pass
+
+    def nonterminal(self, nt, args):
+        collect = ('stmts', 'exprlist', 'kvlist', '_stmts', 'print_items')
+        if nt in collect and len(args) > 1:
+            rv = args[0]
+            rv.append(args[1])
+        else:
+            rv = GenericASTBuilder.nonterminal(self, nt, args)
+        return rv
+
+    def __ambiguity(self, children):
+        print children
+        return GenericASTBuilder.ambiguity(self, children)
+
+    def resolve(self, list):
+        if len(list) == 2 and 'funcdef' in list and 'assign' in list:
+            return 'funcdef'
+        if 'grammar' in list and 'expr' in list:
+            return 'expr'
+        return GenericASTBuilder.resolve(self, list)
+
+
+nop = lambda self, args: None
+p = Parser()
+
+def parse(tokens, customize):
+    global p
+    for k, v in customize.items():
+        if p.customized.has_key(k):
+            continue
+        p.customized[k] = None
+        op = k[:string.rfind(k, '_')]
+        if op in ('BUILD_LIST', 'BUILD_TUPLE', 'BUILD_SET'):
+            rule = 'build_list ::= ' + 'expr1024 ' * (v / 1024) + 'expr32 ' * (v / 32 % 32) + 'expr ' * (v % 32) + k
+        elif op in ('UNPACK_TUPLE', 'UNPACK_SEQUENCE'):
+            rule = 'unpack ::= ' + k + ' designator' * v
+        elif op == 'UNPACK_LIST':
+            rule = 'unpack_list ::= ' + k + ' designator' * v
+        elif op in ('DUP_TOPX', 'RAISE_VARARGS'):
+            continue
+        elif op == 'MAKE_FUNCTION':
+            p.addRule('mklambda ::= %s LOAD_LAMBDA %s' % ('expr ' * v, k), nop)
+            rule = 'mkfunc ::= %s LOAD_CONST %s' % ('expr ' * v, k)
+        elif op == 'MAKE_CLOSURE':
+            p.addRule('mklambda ::= %s load_closure LOAD_LAMBDA %s' % ('expr ' * v, k), nop)
+            p.addRule('genexpr ::= %s load_closure LOAD_GENEXPR %s expr GET_ITER CALL_FUNCTION_1' % ('expr ' * v, k), nop)
+            p.addRule('setcomp ::= %s load_closure LOAD_SETCOMP %s expr GET_ITER CALL_FUNCTION_1' % ('expr ' * v, k), nop)
+            p.addRule('dictcomp ::= %s load_closure LOAD_DICTCOMP %s expr GET_ITER CALL_FUNCTION_1' % ('expr ' * v, k), nop)
+            rule = 'mkfunc ::= %s load_closure LOAD_CONST %s' % ('expr ' * v, k)
+        elif op in ('CALL_FUNCTION', 'CALL_FUNCTION_VAR', 'CALL_FUNCTION_VAR_KW', 'CALL_FUNCTION_KW'):
+            na = v & 255
+            nk = v >> 8 & 255
+            nak = (len(op) - len('CALL_FUNCTION')) / 3
+            rule = 'call_function ::= expr ' + 'expr ' * na + 'kwarg ' * nk + 'expr ' * nak + k
+        else:
+            raise Exception('unknown customize token %s' % k)
+        p.addRule(rule, nop)
+
+    ast = p.parse(tokens)
+    return ast
+
+
+def __build_magic(magic):
+    return struct.pack('Hcc', magic, '\r', '\n')
+
+
+def __by_version(magics):
+    by_version = {}
+    for m, v in magics.items():
+        by_version[v] = m
+
+    return by_version
+
+
+versions = {__build_magic(20121): '1.5',
+ __build_magic(50428): '1.6',
+ __build_magic(50823): '2.0',
+ __build_magic(60202): '2.1',
+ __build_magic(60717): '2.2',
+ __build_magic(62011): '2.3',
+ __build_magic(62021): '2.3',
+ __build_magic(62041): '2.4',
+ __build_magic(62051): '2.4',
+ __build_magic(62061): '2.4',
+ __build_magic(62071): '2.5',
+ __build_magic(62081): '2.5',
+ __build_magic(62091): '2.5',
+ __build_magic(62092): '2.5',
+ __build_magic(62101): '2.5',
+ __build_magic(62111): '2.5',
+ __build_magic(62121): '2.5',
+ __build_magic(62131): '2.5',
+ __build_magic(62151): '2.6',
+ __build_magic(62161): '2.6',
+ __build_magic(62171): '2.7',
+ __build_magic(62181): '2.7',
+ __build_magic(62191): '2.7',
+ __build_magic(62201): '2.7',
+ __build_magic(62211): '2.7'}
+magics = __by_version(versions)
+
+def __show(text, magic):
+    print text, struct.unpack('BBBB', magic),
+    print struct.unpack('HBB', magic)
+
+
+sys.setrecursionlimit(5000)
+
+def _load_file(filename):
+    """
+    load a Python source file and compile it to byte-code
+    
+    _load_module(filename: string): code_object
+    
+    filename:   name of file containing Python source code
+                (normally a .py)
+    code_object: code_object compiled from this source code
+    
+    This function does NOT write any file!
+    """
+    fp = open(filename, 'rb')
+    source = fp.read() + '\n'
+    try:
+        co = compile(source, filename, 'exec')
+    except SyntaxError:
+        print >> sys.stderr, '>>Syntax error in', filename
+        raise
+
+    fp.close()
+    return co
+
+
+def _load_module(filename):
+    """
+    load a module without importing it
+    _load_module(filename: string): code_object
+    
+    filename:   name of file containing Python byte-code object
+                (normally a .pyc)
+    code_object: code_object from this file
+    """
+    import marshal
+    fp = open(filename, 'rb')
+    magic = fp.read(4)
+    try:
+        version = versions[magic]
+    except KeyError:
+        raise ImportError, 'Unknown magic number %s in %s' % (ord(magic[0]) + 256 * ord(magic[1]), filename)
+
+    if version != '2.7':
+        raise ImportError, 'This is a Python %s file! Only Python 2.7 files are supported.' % version
+    fp.read(4)
+    co = marshal.load(fp)
+    fp.close()
+    return (version, co)
+
+
+def uncompyle(version, co, out = None, showasm = 0, showast = 0, deob = 0):
+    """
+    diassembles a given code block 'co'
+    """
+    assert type(co) == types.CodeType
+    __real_out = out or sys.stdout
+    if co.co_filename:
+        print >> __real_out, '#Embedded file name: %s' % co.co_filename
+    scanner = getscanner(version)
+    scanner.setShowAsm(showasm, out)
+    tokens, customize = scanner.disassemble(co, deob=deob)
+    walker = Walker(out, scanner, showast=showast)
+    try:
+        ast = walker.build_ast(tokens, customize)
+    except ParserError as e:
+        print >> __real_out, e
+        raise
+
+    del tokens
+    assert ast == 'stmts'
+    try:
+        if ast[0][0] == ASSIGN_DOC_STRING(co.co_consts[0]):
+            walker.print_docstring('', co.co_consts[0])
+            del ast[0]
+        if ast[-1] == RETURN_NONE:
+            ast.pop()
+    except:
+        pass
+
+    walker.mod_globs = find_globals(ast, set())
+    walker.gen_source(ast, customize)
+    for g in walker.mod_globs:
+        walker.write('global %s ## Warning: Unused global\n' % g)
+
+    if walker.pending_newlines:
+        print >> __real_out
+    if walker.ERROR:
+        raise walker.ERROR
+
+
+def uncompyle_file(filename, outstream = None, showasm = 0, showast = 0, deob = 0):
+    """
+    decompile Python byte-code file (.pyc)
+    """
+    version, co = _load_module(filename)
+    uncompyle(version, co, outstream, showasm, showast, deob)
+    co = None
+
+
+if sys.platform.startswith('linux') and os.uname()[2][:2] == '2.':
+
+    def __memUsage():
+        mi = open('/proc/self/stat', 'r')
+        mu = mi.readline().split()[22]
+        mi.close()
+        return int(mu) / 1000000
+
+
+else:
+
+    def __memUsage():
+        return ''
+
+
+def main(in_base, out_base, files, codes, outfile = None, showasm = 0, showast = 0, do_verify = 0, py = 0, deob = 0):
+    """
+    in_base     base directory for input files
+    out_base    base directory for output files (ignored when
+    files       list of filenames to be uncompyled (relative to src_base)
+    outfile     write output to this filename (overwrites out_base)
+    
+    For redirecting output to
+    - <filename>                outfile=<filename> (out_base is ignored)
+    - files below out_base      out_base=...
+    - stdout                    out_base=None, outfile=None
+    """
+
+    def _get_outstream(outfile):
+        dir = os.path.dirname(outfile)
+        failed_file = outfile + '_failed'
+        if os.path.exists(failed_file):
+            os.remove(failed_file)
+        try:
+            os.makedirs(dir)
+        except OSError:
+            pass
+
+        return open(outfile, 'w')
+
+    of = outfile
+    tot_files = okay_files = failed_files = verify_failed_files = 0
+    for code in codes:
+        version = sys.version[:3]
+        with open(code, 'r') as f:
+            co = compile(f.read(), '', 'exec')
+        uncompyle(sys.version[:3], co, sys.stdout, showasm=showasm, showast=showast, deob=deob)
+
+    for file in files:
+        infile = os.path.join(in_base, file)
+        if of:
+            outstream = _get_outstream(outfile)
+        elif out_base is None:
+            outstream = sys.stdout
+        else:
+            outfile = os.path.join(out_base, file)
+            if py:
+                outfile = outfile[:-1]
+            else:
+                outfile += '_dis'
+            outstream = _get_outstream(outfile)
+        try:
+            uncompyle_file(infile, outstream, showasm, showast, deob)
+            tot_files += 1
+        except KeyboardInterrupt:
+            if outfile:
+                outstream.close()
+                os.remove(outfile)
+            raise
+        except:
+            failed_files += 1
+            sys.stderr.write("### Can't uncompyle %s\n" % infile)
+            if outfile:
+                outstream.close()
+                os.rename(outfile, outfile + '_failed')
+            import traceback
+            traceback.print_exc()
+        else:
+            if outfile:
+                outstream.close()
+            if do_verify:
+                try:
+                    compare_code_with_srcfile(infile, outfile)
+                    okay_files += 1
+                except VerifyCmpError as e:
+                    verify_failed_files += 1
+                    os.rename(outfile, outfile + '_unverified')
+                    print >> sys.stderr, '### Error Verifiying', file
+                    print >> sys.stderr, e
+
+            else:
+                okay_files += 1
+
+    return (tot_files,
+     okay_files,
+     failed_files,
+     verify_failed_files)
+
+
+Usage_short = 'uncompyler [--help] [--verify] [--showasm] [--showast] [-o <path>] FILE|DIR...'
+
+def process_func(fq, rq, src_base, out_base, codes, outfile, showasm, showast, do_verify, py, deob):
+    try:
+        tot_files, okay_files, failed_files, verify_failed_files = (0, 0, 0, 0)
+        while 1:
+            f = fq.get()
+            if f == None:
+                break
+            t, o, f, v = main(src_base, out_base, [f], codes, outfile, showasm, showast, do_verify, py, deob)
+            tot_files += t
+            okay_files += o
+            failed_files += f
+            verify_failed_files += v
+
+    except (Empty, KeyboardInterrupt):
+        pass
+
+    rq.put((tot_files,
+     okay_files,
+     failed_files,
+     verify_failed_files))
+    rq.close()
+
+
+if __name__ == '__main__':
+    showasm = showast = do_verify = multi = norecur = strip_common_path = py = deob = 0
+    outfile = '-'
+    out_base = None
+    codes = []
+    timestamp = True
+    try:
+        opts, files = getopt.getopt(sys.argv[1:], 'hatdrmso:c:', ['help',
+         'verify',
+         'showast',
+         'showasm',
+         'norecur',
+         'py',
+         'deob'])
+    except getopt.GetoptError as e:
+        print >> sys.stderr, '%s: %s' % (os.path.basename(sys.argv[0]), e)
+        sys.exit(-1)
+
+    for opt, val in opts:
+        if opt in ('-h', '--help'):
+            print __doc__
+            sys.exit(0)
+        elif opt == '--verify':
+            do_verify = 1
+        elif opt in ('--showasm', '-a'):
+            showasm = 1
+            do_verify = 0
+        elif opt in ('--showast', '-t'):
+            showast = 1
+            do_verify = 0
+        elif opt == '-o':
+            outfile = val
+        elif opt == '-d':
+            timestamp = False
+        elif opt == '-c':
+            codes.append(val)
+        elif opt == '-m':
+            multi = 1
+        elif opt == '--norecur':
+            norecur = 1
+        elif opt == '-s':
+            strip_common_path = 1
+        elif opt == '--py':
+            py = 1
+        elif opt == '--deob':
+            deob = 1
+        else:
+            print opt
+            print Usage_short
+            sys.exit(1)
+
+    if not norecur:
+        expanded_files = []
+        for f in files:
+            if os.path.isdir(f):
+                for root, _, dir_files in os.walk(f):
+                    for df in dir_files:
+                        if df.endswith('.pyc') or df.endswith('.pyo'):
+                            expanded_files.append(os.path.join(root, df))
+
+            else:
+                expanded_files.append(f)
+
+        files = expanded_files
+    if strip_common_path:
+        src_base = os.path.commonprefix(files)
+        if src_base[-1:] != os.sep:
+            src_base = os.path.dirname(src_base)
+        if src_base:
+            sb_len = len(os.path.join(src_base, ''))
+            files = map(lambda f: f[sb_len:], files)
+            del sb_len
+    else:
+        src_base = ''
+    if outfile == '-':
+        outfile = None
+    elif outfile and os.path.isdir(outfile):
+        out_base = outfile
+        outfile = None
+    elif outfile and len(files) > 1:
+        out_base = outfile
+        outfile = None
+    if not multi:
+        try:
+            result = main(src_base, out_base, files, codes, outfile, showasm, showast, do_verify, py, deob)
+            print '# decompiled %i files: %i okay, %i failed, %i verify failed' % result
+        except KeyboardInterrupt:
+            pass
+        except VerifyCmpError:
+            raise
+
+    else:
+        numproc = cpu_count()
+        fqueue = Queue(len(files) + numproc)
+        for f in files:
+            fqueue.put(f)
+
+        for i in range(numproc):
+            fqueue.put(None)
+
+        rqueue = Queue(numproc)
+        try:
+            procs = [ Process(target=process_func, args=(fqueue,
+             rqueue,
+             src_base,
+             out_base,
+             codes,
+             outfile,
+             showasm,
+             showast,
+             do_verify,
+             py,
+             deob)) for i in range(numproc) ]
+            for p in procs:
+                p.start()
+
+            for p in procs:
+                p.join()
+
+            try:
+                tot_files, okay_files, failed_files, verify_failed_files = (0,
+                 0,
+                 0,
+                 0)
+                while 1:
+                    t, o, f, v = rqueue.get(False)
+                    tot_files += t
+                    okay_files += o
+                    failed_files += f
+                    verify_failed_files += v
+
+            except Empty:
+                pass
+
+            print '# decompiled %i files: %i okay, %i failed, %i verify failed' % (tot_files,
+             okay_files,
+             failed_files,
+             verify_failed_files)
+        except (KeyboardInterrupt, OSError):
+            pass
